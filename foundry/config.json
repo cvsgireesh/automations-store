@@ -1,0 +1,27 @@
+{
+  "allowed_hosts": [
+    "gumroad.com",
+    "api.github.com",
+    "github.com"
+  ],
+  "sources": [
+    {
+      "url": "https://gumroad.com/discover?query=Hermes%20Agent",
+      "source_type": "market_search",
+      "parser": "gumroad_search",
+      "fixture": "gumroad-search.html"
+    },
+    {
+      "url": "https://gumroad.com/l/hermes-workflow-playbook",
+      "source_type": "paid_comparable",
+      "parser": "gumroad_product",
+      "fixture": "gumroad-product.html"
+    },
+    {
+      "url": "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest",
+      "source_type": "official_release",
+      "parser": "github_release",
+      "fixture": "github-release.json"
+    }
+  ]
+}
