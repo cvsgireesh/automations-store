@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
+import sys
 
 
 FORBIDDEN_CLAIMS = {
@@ -19,9 +21,7 @@ FORBIDDEN_CLAIMS = {
     "unsupported_testimonial": re.compile(
         r"\b(?:a\s+)?(?:buyer|customer|user)\s+(?:says|said|writes|wrote|reports|reported)\b"
         r"|<(?:testimonial|review)\b"
-        r"|(?:class|id|data-[\w-]+)\s*=\s*['\"][^'\"]*\b(?:testimonial|review)s?\b"
-        r"|[\"“][^\"”\r\n]{3,}[\"”]\s*(?:[-–—]|&(?:mdash|ndash);)\s*"
-        r"[A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*){0,3}(?:\s*,\s*[^\r\n]{2,80})?",
+        r"|(?:class|id|data-[\w-]+)\s*=\s*['\"][^'\"]*\b(?:testimonial|review)s?\b",
         re.I,
     ),
     "unsupported_customer_count": re.compile(r"\b\d[\d,]*(?:\.\d+)?\+?\s+(?:customers?|users?|buyers?)\b", re.I),
@@ -58,6 +58,13 @@ FORBIDDEN_CLAIMS = {
     ),
     "unsupported_affiliation_claim": re.compile(r"\b(?:official(?:ly)?|partnered|certified|endorsed)\b", re.I),
 }
+ATTRIBUTED_TESTIMONIAL_PATTERN = re.compile(
+    r"(?:[\"“][^\"”\r\n]{3,}[\"”])\s*(?:[-–—]|&(?:mdash|ndash);)\s*"
+    r"(?:[A-Z][a-z][A-Za-z.'-]*(?:\s+[A-Z][a-z][A-Za-z.'-]*){1,3}"
+    r"|@[A-Za-z0-9_]{2,}"
+    r"|[A-Z][a-z][A-Za-z.'-]*\s*,\s*[A-Z][A-Za-z0-9& .'-]{1,80})"
+    r"(?:\s*,\s*[A-Z][A-Za-z0-9& .'-]{1,80})?"
+)
 MARKDOWN_CROSSED_OUT_PRICE = re.compile(r"~~\s*\$?\d[\d,]*(?:\.\d+)?\s*~~")
 CSS_CROSSED_OUT_PRICE = re.compile(
     r"(?:[.#][\w-]*(?:old|original|was)[\w-]*price[\w-]*|"
@@ -95,6 +102,10 @@ def audit_text(text: str, path: str = "") -> list[AuditFinding]:
     for code, pattern in FORBIDDEN_CLAIMS.items():
         if pattern.search(text):
             findings.append(AuditFinding(code, path))
+    if ATTRIBUTED_TESTIMONIAL_PATTERN.search(text) and not any(
+        finding.code == "unsupported_testimonial" for finding in findings
+    ):
+        findings.append(AuditFinding("unsupported_testimonial", path))
     if MARKDOWN_CROSSED_OUT_PRICE.search(text) or CSS_CROSSED_OUT_PRICE.search(text):
         findings.append(AuditFinding("unsupported_discount_claim", path))
     if any(pattern.search(text) for pattern in SECRET_PATTERNS):
@@ -206,3 +217,48 @@ def audit_tree(root: str | Path) -> list[AuditFinding]:
 
     findings.extend(_audit_third_party_notices(source_root))
     return sorted(findings, key=lambda finding: (finding.path, finding.code, finding.detail))
+
+
+def _cli_findings_for_path(path_text: str) -> list[AuditFinding]:
+    path = Path(path_text)
+    display_path = path.as_posix()
+    if path.is_symlink():
+        return [AuditFinding("symlink", display_path)]
+    if path.is_dir():
+        return [
+            AuditFinding(finding.code, (path / finding.path).as_posix(), finding.detail)
+            for finding in audit_tree(path)
+        ]
+    if path.is_file():
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return [AuditFinding("unreadable_input", display_path)]
+        return audit_text(text, display_path)
+    return [AuditFinding("invalid_input", display_path)]
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run a deterministic audit over files, directories, and optionally stdin."""
+    parser = argparse.ArgumentParser(description="Audit release copy and source trees.")
+    parser.add_argument("paths", metavar="PATH", nargs="*", help="file or directory to audit")
+    parser.add_argument("--stdin", action="store_true", dest="read_stdin", help="audit text read from standard input")
+    arguments = parser.parse_args(argv)
+    if not arguments.paths and not arguments.read_stdin:
+        parser.error("provide at least one PATH or --stdin")
+
+    findings: list[AuditFinding] = []
+    for path_text in arguments.paths:
+        findings.extend(_cli_findings_for_path(path_text))
+    if arguments.read_stdin:
+        findings.extend(audit_text(sys.stdin.read(), "<stdin>"))
+    findings.sort(key=lambda finding: (finding.path, finding.code, finding.detail))
+    for finding in findings:
+        suffix = f": {finding.detail}" if finding.detail else ""
+        print(f"{finding.path}: {finding.code}{suffix}")
+    print(f"{len(findings)} findings")
+    return 0 if not findings else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

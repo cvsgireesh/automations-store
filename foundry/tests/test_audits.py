@@ -1,8 +1,14 @@
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
 from foundry.src.audits import audit_text, audit_tree
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+KIT_ROOT = REPOSITORY_ROOT / "private-products" / "hermes-hybrid-operator-kit"
 
 
 class AuditTextTests(unittest.TestCase):
@@ -67,6 +73,10 @@ class AuditTextTests(unittest.TestCase):
     def test_rejects_attributed_quoted_testimonials(self):
         findings = audit_text('“This is excellent.” — Jane Doe, Acme Corp', "sales.html")
         self.assertIn("unsupported_testimonial", {finding.code for finding in findings})
+
+    def test_does_not_mistake_shell_comparison_for_attributed_testimonial(self):
+        findings = audit_text('[ "$APPLY" -eq 0 ]', "scripts/install.sh")
+        self.assertNotIn("unsupported_testimonial", {finding.code for finding in findings})
 
     def test_rejects_numeric_performance_and_cost_benchmarks(self):
         findings = audit_text("Processes jobs 2x faster for $0.01 per task.", "sales.html")
@@ -201,6 +211,66 @@ class AuditTreeTests(unittest.TestCase):
     def test_accepts_explicit_no_third_party_code_notice_when_vendor_directories_are_absent(self):
         self.write("THIRD_PARTY_NOTICES.md", "No third-party code is included in this release.\n")
         self.assertEqual(audit_tree(self.root), [])
+
+    def test_does_not_flag_the_kit_shell_installer_as_a_testimonial(self):
+        installer = KIT_ROOT / "scripts" / "install.sh"
+        self.assertTrue(installer.is_file())
+        findings = audit_tree(KIT_ROOT)
+        self.assertNotIn(
+            "unsupported_testimonial",
+            {finding.code for finding in findings if finding.path == "scripts/install.sh"},
+        )
+
+
+class AuditCliTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def run_cli(self, *paths, stdin=None):
+        return subprocess.run(
+            [sys.executable, "-m", "foundry.src.audits", *map(str, paths)],
+            cwd=REPOSITORY_ROOT,
+            input=stdin,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_cli_reports_zero_for_a_clean_tree(self):
+        clean_tree = self.root / "clean"
+        clean_tree.mkdir()
+        (clean_tree / "README.md").write_text("A straightforward product description.\n", encoding="utf-8")
+        result = self.run_cli(clean_tree)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "0 findings\n")
+
+    def test_cli_reports_claim_and_secret_findings_for_multiple_files(self):
+        claim = self.root / "claim.txt"
+        secret = self.root / "secret.txt"
+        claim.write_text("Best seller!\n", encoding="utf-8")
+        secret.write_text("TOKEN=secretsecretsecret\n", encoding="utf-8")
+        result = self.run_cli(secret, claim)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"{claim.as_posix()}: unsupported_bestseller\n", result.stdout)
+        self.assertIn(f"{secret.as_posix()}: secret_like_value\n", result.stdout)
+        self.assertTrue(result.stdout.endswith("2 findings\n"))
+
+    def test_cli_reports_missing_paths_as_invalid_inputs(self):
+        missing = self.root / "missing"
+        result = self.run_cli(missing)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"{missing.as_posix()}: invalid_input\n", result.stdout)
+        self.assertTrue(result.stdout.endswith("1 findings\n"))
+
+    def test_cli_audits_piped_stdin(self):
+        result = self.run_cli("--stdin", stdin="A buyer says this is excellent.")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("<stdin>: unsupported_testimonial\n", result.stdout)
+        self.assertTrue(result.stdout.endswith("1 findings\n"))
 
 
 if __name__ == "__main__":
