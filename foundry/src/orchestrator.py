@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-import errno
 import hashlib
 import json
 import os
@@ -22,20 +22,14 @@ import struct
 import subprocess
 import sys
 import tempfile
-import time as clock
 from typing import Any, Iterator, Mapping, Sequence
 import uuid
 from zoneinfo import ZoneInfo
 
-try:  # POSIX hosts use flock; Windows uses msvcrt byte locks below.
+try:  # Authority state changes require POSIX flock plus directory descriptors.
     import fcntl
 except ImportError:  # pragma: no cover - exercised by native Windows canary
     fcntl = None  # type: ignore[assignment]
-
-try:  # pragma: no cover - unavailable on POSIX hosts
-    import msvcrt
-except ImportError:  # pragma: no cover - exercised on POSIX hosts
-    msvcrt = None  # type: ignore[assignment]
 
 from .collector import collect
 from .audits import audit_text, audit_tree
@@ -51,7 +45,8 @@ SIGNALS_FILE = "latest-signals.json"
 COLLECTION_STATUS_FILE = "collection-status.json"
 CANDIDATE_FILE = "current-candidate.json"
 SCOUT_PROPOSAL_FILE = "scout-candidate.json"
-SCOUT_RECEIPTS_DIRECTORY = "scout-receipts"
+SCOUT_RECEIPT_PREFIX = ".scout-receipt-"
+SCOUT_RECEIPT_SUFFIX = ".json"
 SCOUT_RECEIPT_LIMIT = 32
 PLATFORM_VERIFICATION_FILE = "platform-verification.json"
 GATE_FILE = "gate.json"
@@ -68,8 +63,6 @@ NO_WINDOWS_LIVE_READINESS = "no Windows live Hermes readiness"
 # leaves those timestamps untouched, and candidates may use evidence at most
 # this many Chicago calendar days old.
 MAX_SIGNAL_AGE_DAYS = 14
-LOCK_TIMEOUT_SECONDS = 30.0
-LOCK_RETRY_SECONDS = 0.05
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -134,62 +127,175 @@ def _observed_at(observed_date: str) -> str:
     return datetime.combine(date.fromisoformat(observed_date), time.min, tzinfo=CHICAGO).isoformat()
 
 
-def _lock_contention(error: OSError) -> bool:
-    """Recognize only ordinary advisory-lock contention across supported hosts."""
-    return error.errno in (errno.EACCES, errno.EAGAIN) or getattr(error, "winerror", None) in (32, 33)
+def _file_identity(details: os.stat_result) -> tuple[int, int]:
+    """Return the stable inode identity used for no-follow path validation."""
+    return details.st_dev, details.st_ino
+
+
+def _same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
+    return _file_identity(first) == _file_identity(second)
+
+
+def _require_regular_directory(path: Path, details: os.stat_result, label: str) -> None:
+    """Reject a link, reparse point, or non-directory before state access."""
+    if _is_link_or_reparse(path, details) or not stat.S_ISDIR(details.st_mode):
+        raise FoundryError(f"{label} must be a regular directory, not a link or reparse point")
+
+
+def _posix_state_directory_flags() -> int:
+    """Return the mandatory flags for a descriptor-bound state directory."""
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    nofollow_flag = getattr(os, "O_NOFOLLOW", None)
+    if not directory_flag or not nofollow_flag:
+        raise FoundryError("secure state locking requires O_DIRECTORY and O_NOFOLLOW")
+    return os.O_RDONLY | directory_flag | nofollow_flag
+
+
+def _require_posix_state_authority_host() -> None:
+    """Reject mutable control-plane work without no-follow directory FDs."""
+    if os.name == "nt" or fcntl is None:
+        raise FoundryError(
+            "Windows Foundry state mutation is unsupported; run the control plane on a POSIX no-follow directory-FD host"
+        )
+    _posix_state_directory_flags()
+
+
+def _open_verified_posix_directory(path: Path, label: str, *, parent_fd: int | None = None,
+                                   name: str | None = None) -> tuple[int, os.stat_result]:
+    """Open one no-follow directory and bind its path identity to its FD."""
+    try:
+        if parent_fd is None:
+            before = path.lstat()
+        else:
+            if name is None:
+                raise FoundryError("secure state directory name is missing")
+            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise FoundryError(f"{label} could not be inspected") from error
+    _require_regular_directory(path, before, label)
+    try:
+        if parent_fd is None:
+            descriptor = os.open(path, _posix_state_directory_flags())
+        else:
+            descriptor = os.open(name, _posix_state_directory_flags(), dir_fd=parent_fd)
+    except OSError as error:
+        raise FoundryError(f"{label} could not be opened without following links") from error
+    try:
+        opened = os.fstat(descriptor)
+        if parent_fd is None:
+            after = path.lstat()
+        else:
+            after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        _require_regular_directory(path, opened, label)
+        _require_regular_directory(path, after, label)
+        if not (_same_file_identity(before, opened) and _same_file_identity(opened, after)):
+            raise FoundryError(f"{label} changed while it was being opened")
+        return descriptor, opened
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_posix_state_directory(repo_root: Path, foundry_fd: int,
+                                foundry_details: os.stat_result) -> tuple[Path, int, tuple[int, int]]:
+    """Create/open state after the caller has locked verified Foundry ancestry."""
+    foundry = _foundry_root(repo_root)
+    state = _state_root(repo_root)
+    try:
+        os.mkdir(STATE_NAME, mode=0o700, dir_fd=foundry_fd)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise FoundryError("Foundry state directory could not be created") from error
+    state_fd, state_details = _open_verified_posix_directory(
+        state,
+        "Foundry state directory",
+        parent_fd=foundry_fd,
+        name=STATE_NAME,
+    )
+    try:
+        foundry_after = foundry.lstat()
+        _require_regular_directory(foundry, foundry_after, "checked-in foundry directory")
+        if not _same_file_identity(foundry_details, foundry_after):
+            raise FoundryError("checked-in foundry directory changed while state was opened")
+        return state, state_fd, _file_identity(state_details)
+    except Exception:
+        os.close(state_fd)
+        raise
+
+
+@dataclass(frozen=True)
+class _HeldStateLock:
+    """The state directory identity retained while a state operation runs."""
+
+    state_root: Path
+    descriptor: int
+    state_identity: tuple[int, int]
+    foundry_descriptor: int
 
 
 def _acquire_state_lock(descriptor: int) -> None:
-    """Take a bounded one-byte state lock through the host's native backend."""
-    if fcntl is not None:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            return
-        except OSError as error:
-            raise FoundryError("cannot acquire Foundry state lock") from error
-    if msvcrt is None:  # pragma: no cover - every supported host has one backend
-        raise FoundryError("no supported Foundry state-lock backend")
-    deadline = clock.monotonic() + LOCK_TIMEOUT_SECONDS
-    while True:  # pragma: no cover - exercised by native Windows canary
-        try:
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-            return
-        except OSError as error:
-            if not _lock_contention(error):
-                raise FoundryError("cannot acquire Foundry state lock") from error
-            if clock.monotonic() >= deadline:
-                raise FoundryError("timed out waiting for Foundry state lock") from error
-            clock.sleep(LOCK_RETRY_SECONDS)
+    """Take an exclusive lock on a retained POSIX directory descriptor."""
+    if fcntl is None:  # pragma: no cover - native Windows fails before here
+        raise FoundryError("Foundry state locking requires POSIX flock")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except OSError as error:
+        raise FoundryError("cannot acquire Foundry state lock") from error
 
 
 def _release_state_lock(descriptor: int) -> None:
     if fcntl is not None:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
-        return
-    if msvcrt is not None:  # pragma: no cover - exercised by native Windows canary
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
 
 
 @contextmanager
-def state_lock(repo_root: str | Path) -> Iterator[None]:
-    """Serialize mutable Foundry state with a native advisory one-byte lock."""
+def state_lock(repo_root: str | Path) -> Iterator[_HeldStateLock]:
+    """Serialize mutable Foundry state with retained POSIX directory FDs.
+
+    The authority control plane is deliberately unavailable on Windows.  The
+    Python standard library cannot perform the descriptor-relative state-file
+    operations needed to survive a state-directory junction/rename race there.
+    A Windows compatibility host may run pure product checks, but must not
+    collect, gate, stage, consume, or package Foundry state.
+
+    Scout claim/read/receipt/stage operations use these descriptors for every
+    pathname-sensitive action. The lock protects cooperating Foundry processes
+    from replacement; it does not defend against arbitrary same-account writes
+    through an already-authorized descriptor. Receipt hard links retain those
+    bytes for operator recovery.
+    """
+    _require_posix_state_authority_host()
     root = _repo_root(repo_root)
-    state_root = _state_root(root)
-    state_root.mkdir(parents=True, exist_ok=True)
-    lock_path = state_root / ".lock"
-    with lock_path.open("a+b") as lock_file:
-        lock_file.seek(0, os.SEEK_END)
-        if lock_file.tell() == 0:
-            lock_file.write(b"\0")
-            lock_file.flush()
-            os.fsync(lock_file.fileno())
-        _acquire_state_lock(lock_file.fileno())
+    foundry = _foundry_root(root)
+    foundry_fd, foundry_details = _open_verified_posix_directory(foundry, "checked-in foundry directory")
+    state_fd: int | None = None
+    foundry_acquired = False
+    state_acquired = False
+    try:
+        # This stable parent lock prevents a replacement state directory from
+        # becoming a second lock domain. The validated state FD is also
+        # flocked and retained for descriptor-relative Scout work.
+        _acquire_state_lock(foundry_fd)
+        foundry_acquired = True
+        state_root, state_fd, state_identity = _open_posix_state_directory(root, foundry_fd, foundry_details)
+        _acquire_state_lock(state_fd)
+        state_acquired = True
+        yield _HeldStateLock(state_root, state_fd, state_identity, foundry_fd)
+    finally:
         try:
-            yield
+            if state_fd is not None:
+                try:
+                    if state_acquired:
+                        _release_state_lock(state_fd)
+                finally:
+                    os.close(state_fd)
         finally:
-            _release_state_lock(lock_file.fileno())
+            try:
+                if foundry_acquired:
+                    _release_state_lock(foundry_fd)
+            finally:
+                os.close(foundry_fd)
 
 
 def _canonical_json(payload: Any) -> bytes:
@@ -410,6 +516,9 @@ def collect_signals(repo_root: str | Path, observed_date: str | None = None, *,
                     config: Mapping[str, Any] | str | Path | None = None,
                     fixture_dir: str | Path | None = None) -> dict[str, Any]:
     """Boundedly collect signals while preserving the previous good record on error."""
+    # Do this before a network/file fetch: a Windows compatibility host must
+    # not do work it cannot commit through the authority state transaction.
+    _require_posix_state_authority_host()
     root = _repo_root(repo_root)
     observation_date = _validated_date(observed_date)
     source_config = config if config is not None else _foundry_root(root) / "config.json"
@@ -529,25 +638,8 @@ def stage_candidate(repo_root: str | Path, payload: Mapping[str, Any]) -> dict[s
     candidate = validate_candidate(payload)
     digest = candidate_sha256(candidate)
     today = chicago_date()
-    with state_lock(root):
-        existing = _read_json(_candidate_path(root))
-        if isinstance(existing, Mapping):
-            previous_digest = existing.get("candidate_sha256")
-            if previous_digest == digest:
-                return {"candidate_sha256": digest, "status": "noop"}
-            if not isinstance(previous_digest, str) or not previous_digest:
-                raise CandidateError("staged candidate state lacks a safe identity")
-            if not _has_successful_candidate_unlocked(root, previous_digest):
-                raise CandidateError("a distinct candidate is already staged and unbuilt")
-        atomic_write_json(
-            _candidate_path(root),
-            {
-                "candidate": candidate,
-                "candidate_sha256": digest,
-                "staged_date": today,
-            },
-        )
-    return {"candidate_sha256": digest, "status": "staged"}
+    with state_lock(root) as held:
+        return _stage_candidate_unlocked(root, candidate, digest, today, held)
 
 
 def _lexical_absolute(path: str | Path) -> Path:
@@ -568,7 +660,7 @@ def _read_regular_candidate_bytes(candidate_path: Path) -> tuple[bytes, Proposal
         before = candidate_path.lstat()
     except OSError as error:
         raise CandidateError(f"cannot read candidate JSON: {candidate_path}") from error
-    if not stat.S_ISREG(before.st_mode):
+    if _is_link_or_reparse(candidate_path, before) or not stat.S_ISREG(before.st_mode):
         raise CandidateError("Scout proposal must be a regular file, not a symlink or special file")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -602,63 +694,271 @@ def _read_regular_candidate_bytes(candidate_path: Path) -> tuple[bytes, Proposal
     return raw, identity
 
 
-def _load_regular_candidate_file(candidate_path: Path) -> tuple[dict[str, Any], ProposalIdentity]:
-    """Decode an exact no-follow proposal read for safe staged consumption."""
-    raw, identity = _read_regular_candidate_bytes(candidate_path)
+def _load_regular_candidate_file_at(name: str, directory_fd: int) -> tuple[dict[str, Any], ProposalIdentity]:
+    """Decode one exact descriptor-relative Scout proposal."""
+    raw, identity = _read_regular_candidate_bytes_at(name, directory_fd)
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise CandidateError(f"cannot read candidate JSON: {candidate_path}") from error
+        raise CandidateError("Scout proposal JSON could not be decoded") from error
     if not isinstance(payload, Mapping):
         raise CandidateError("candidate JSON must be an object")
     return dict(payload), identity
 
 
-def _proposal_matches_identity(candidate_path: Path, expected: ProposalIdentity) -> bool:
-    """Verify a claimed handoff has not changed through a held descriptor."""
+def _claim_scout_proposal(proposal: Path, held: _HeldStateLock) -> Path:
+    """Atomically claim only a regular proposal inside the retained state root."""
+    _assert_held_state_path(held)
+    if proposal.parent != held.state_root:
+        raise CandidateError("Scout proposal must remain in the locked state directory")
+    claimed_name = f".{proposal.name}.claim-{uuid.uuid4().hex}"
     try:
-        _, current = _read_regular_candidate_bytes(candidate_path)
+        before = os.stat(proposal.name, dir_fd=held.descriptor, follow_symlinks=False)
+    except OSError as error:
+        raise CandidateError("Scout proposal could not be inspected in the locked state directory") from error
+    if _is_link_or_reparse(Path(proposal.name), before) or not stat.S_ISREG(before.st_mode):
+        raise CandidateError("Scout proposal must be a regular file, not a symlink or special file")
+    try:
+        os.rename(
+            proposal.name,
+            claimed_name,
+            src_dir_fd=held.descriptor,
+            dst_dir_fd=held.descriptor,
+        )
+        after = os.stat(claimed_name, dir_fd=held.descriptor, follow_symlinks=False)
+    except OSError as error:
+        raise CandidateError("Scout proposal could not be claimed atomically") from error
+    if (
+        _is_link_or_reparse(Path(claimed_name), after)
+        or not stat.S_ISREG(after.st_mode)
+        or not _same_file_identity(before, after)
+    ):
+        raise CandidateError("Scout proposal changed while it was being claimed")
+    _assert_held_state_path(held)
+    return held.state_root / claimed_name
+
+
+def _receipt_name(identity: ProposalIdentity) -> str:
+    """Create a direct-state receipt name bound to the original raw digest."""
+    return f"{SCOUT_RECEIPT_PREFIX}{identity[-1]}-{uuid.uuid4().hex}{SCOUT_RECEIPT_SUFFIX}"
+
+
+def _is_receipt_name(name: str) -> bool:
+    return name.startswith(SCOUT_RECEIPT_PREFIX) and name.endswith(SCOUT_RECEIPT_SUFFIX)
+
+
+def _claimed_name_in_held_state(claimed: Path, held: _HeldStateLock) -> str:
+    """Refuse a receipt source outside the exact locked state directory."""
+    if claimed.parent != held.state_root or claimed.name in {"", ".", ".."}:
+        raise CandidateError("Scout receipt source must remain in the locked state directory")
+    return claimed.name
+
+
+def _read_regular_candidate_bytes_at(name: str, directory_fd: int) -> tuple[bytes, ProposalIdentity]:
+    """Read a candidate through one retained POSIX directory descriptor."""
+    try:
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise CandidateError("Scout proposal could not be inspected in the locked state directory") from error
+    if not stat.S_ISREG(before.st_mode):
+        raise CandidateError("Scout proposal must be a regular file, not a symlink or special file")
+    nofollow_flag = getattr(os, "O_NOFOLLOW", None)
+    if not nofollow_flag:
+        raise CandidateError("Scout proposal cannot be read safely on this host")
+    try:
+        descriptor = os.open(name, os.O_RDONLY | nofollow_flag, dir_fd=directory_fd)
+    except OSError as error:
+        raise CandidateError("Scout proposal could not be opened without following links") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not _same_file_identity(before, opened):
+            raise CandidateError("Scout proposal changed while it was being opened")
+        with os.fdopen(descriptor, "rb", closefd=True) as candidate_file:
+            descriptor = -1
+            raw = candidate_file.read()
+            after_open = os.fstat(candidate_file.fileno())
+        after_path = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise CandidateError("Scout proposal could not be read in the locked state directory") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not (
+        stat.S_ISREG(after_open.st_mode)
+        and stat.S_ISREG(after_path.st_mode)
+        and _same_file_identity(before, after_open)
+        and _same_file_identity(after_open, after_path)
+        and after_open.st_size == len(raw)
+    ):
+        raise CandidateError("Scout proposal changed while it was being read")
+    return raw, (
+        after_open.st_dev,
+        after_open.st_ino,
+        after_open.st_size,
+        after_open.st_mtime_ns,
+        hashlib.sha256(raw).hexdigest(),
+    )
+
+
+def _proposal_matches_identity_at(name: str, directory_fd: int, expected: ProposalIdentity) -> bool:
+    try:
+        _, current = _read_regular_candidate_bytes_at(name, directory_fd)
     except CandidateError:
         return False
     return current == expected
 
 
-def _claim_scout_proposal(proposal: Path) -> Path:
-    """Atomically move the one approved proposal aside before consuming it.
-
-    ``os.replace`` moves a symlink itself rather than following it.  The
-    subsequent no-follow regular-file read therefore rejects a swap safely,
-    while a new Scout proposal written at the original lexical path survives.
-    """
+def _assert_held_state_path(held: _HeldStateLock) -> None:
+    """Fail closed if a locked state pathname no longer names its retained FD."""
     try:
-        before = proposal.lstat()
+        current = os.stat(STATE_NAME, dir_fd=held.foundry_descriptor, follow_symlinks=False)
     except OSError as error:
-        raise CandidateError(f"cannot read candidate JSON: {proposal}") from error
-    if not stat.S_ISREG(before.st_mode):
-        raise CandidateError("Scout proposal must be a regular file, not a symlink or special file")
-    claimed = proposal.with_name(f".{proposal.name}.claim-{uuid.uuid4().hex}")
-    try:
-        os.replace(proposal, claimed)
-    except OSError as error:
-        raise CandidateError("Scout proposal could not be claimed atomically") from error
-    return claimed
+        raise CandidateError("Foundry state directory disappeared during Scout handling") from error
+    if (
+        _is_link_or_reparse(held.state_root, current)
+        or not stat.S_ISDIR(current.st_mode)
+        or _file_identity(current) != held.state_identity
+    ):
+        raise CandidateError("Foundry state directory changed during Scout handling")
 
 
-def _scout_receipt_root(repo_root: Path) -> Path:
-    """Return the bounded ignored receipt quarantine without following links."""
-    receipts = _state_root(repo_root) / SCOUT_RECEIPTS_DIRECTORY
+def _read_state_json_at(directory_fd: int, name: str, *, default: Any = None) -> Any:
+    """Read one state JSON file through its retained POSIX directory FD."""
     try:
-        details = receipts.lstat()
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
-        try:
-            receipts.mkdir()
-            details = receipts.lstat()
-        except OSError as error:
-            raise CandidateError("Scout receipt quarantine could not be created") from error
+        return default
     except OSError as error:
-        raise CandidateError("Scout receipt quarantine could not be inspected") from error
-    if receipts.is_symlink() or not stat.S_ISDIR(details.st_mode):
-        raise CandidateError("Scout receipt quarantine must be a regular directory")
+        raise CandidateError("Foundry state file could not be inspected") from error
+    if _is_link_or_reparse(Path(name), before) or not stat.S_ISREG(before.st_mode):
+        raise CandidateError("Foundry state file must be a regular non-link file")
+    nofollow_flag = getattr(os, "O_NOFOLLOW", None)
+    if not nofollow_flag:
+        raise CandidateError("Foundry state file cannot be read safely on this host")
+    try:
+        descriptor = os.open(name, os.O_RDONLY | nofollow_flag, dir_fd=directory_fd)
+    except OSError as error:
+        raise CandidateError("Foundry state file could not be opened without following links") from error
+    try:
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            opened = os.fstat(source.fileno())
+            if not stat.S_ISREG(opened.st_mode) or not _same_file_identity(before, opened):
+                raise CandidateError("Foundry state file changed while it was being opened")
+            raw = source.read()
+            after_open = os.fstat(source.fileno())
+        after_path = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise CandidateError("Foundry state file could not be read") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not (
+        stat.S_ISREG(after_open.st_mode)
+        and stat.S_ISREG(after_path.st_mode)
+        and _same_file_identity(before, after_open)
+        and _same_file_identity(after_open, after_path)
+        and after_open.st_size == len(raw)
+    ):
+        raise CandidateError("Foundry state file changed while it was being read")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CandidateError("Foundry state file is invalid JSON") from error
+
+
+def _atomic_write_json_at(directory_fd: int, name: str, payload: Any) -> None:
+    """Atomically replace one state JSON name through its retained directory FD."""
+    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    replaced = False
+    try:
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except OSError as error:
+            raise CandidateError("Foundry state temporary file could not be created") from error
+        with os.fdopen(descriptor, "wb") as target:
+            descriptor = None
+            target.write(_canonical_json(payload))
+            target.flush()
+            os.fsync(target.fileno())
+        try:
+            os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        except OSError as error:
+            raise CandidateError("Foundry state file could not be replaced atomically") from error
+        replaced = True
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if not replaced:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
+def _has_successful_candidate_in_held_state(repo_root: Path, held: _HeldStateLock,
+                                            candidate_digest: str) -> bool:
+    """Read the release ledger through the same descriptor as a consumed claim."""
+    payload = _read_state_json_at(held.descriptor, LEDGER_FILE, default={"releases": []})
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("releases"), list):
+        raise CandidateError("release ledger must contain a releases list")
+    if any(not isinstance(release, Mapping) for release in payload["releases"]):
+        raise CandidateError("release ledger entries must be objects")
+    return any(
+        release.get("status") == "success"
+        and release.get("candidate_sha256") == candidate_digest
+        for release in payload["releases"]
+    )
+
+
+def _stage_candidate_unlocked(repo_root: Path, candidate: Mapping[str, Any], digest: str,
+                              today: str, held: _HeldStateLock) -> dict[str, Any]:
+    """Stage one already-validated candidate inside a held state transaction."""
+    _assert_held_state_path(held)
+    existing = _read_state_json_at(held.descriptor, CANDIDATE_FILE)
+    if isinstance(existing, Mapping):
+        previous_digest = existing.get("candidate_sha256")
+        if previous_digest == digest:
+            return {"candidate_sha256": digest, "status": "noop"}
+        if not isinstance(previous_digest, str) or not previous_digest:
+            raise CandidateError("staged candidate state lacks a safe identity")
+        if not _has_successful_candidate_in_held_state(repo_root, held, previous_digest):
+            raise CandidateError("a distinct candidate is already staged and unbuilt")
+    payload = {
+        "candidate": dict(candidate),
+        "candidate_sha256": digest,
+        "staged_date": today,
+    }
+    _assert_held_state_path(held)
+    _atomic_write_json_at(held.descriptor, CANDIDATE_FILE, payload)
+    return {"candidate_sha256": digest, "status": "staged"}
+
+
+def _posix_receipt_entries(held: _HeldStateLock) -> list[str]:
+    """List direct-state receipts through the held FD, never a mutable path."""
+    try:
+        names = os.listdir(held.descriptor)
+    except OSError as error:
+        raise CandidateError("Scout receipt quarantine could not be listed") from error
+    receipts: list[str] = []
+    for name in names:
+        if not _is_receipt_name(name):
+            continue
+        try:
+            details = os.stat(name, dir_fd=held.descriptor, follow_symlinks=False)
+        except OSError as error:
+            raise CandidateError("Scout receipt quarantine contains an unreadable entry") from error
+        if _is_link_or_reparse(Path(name), details) or not stat.S_ISREG(details.st_mode):
+            raise CandidateError("Scout receipt quarantine contains an unsafe entry")
+        receipts.append(name)
     return receipts
 
 
@@ -674,39 +974,77 @@ def _create_scout_receipt(repo_root: Path, claimed: Path, identity: ProposalIden
     # The capacity check and hard-link reservation must be one state-locked
     # operation.  Independent Scout handoffs can otherwise both observe the
     # final apparent slot and create an unbounded pair of durable receipts.
-    with state_lock(repo_root):
-        return _create_scout_receipt_unlocked(repo_root, claimed, identity)
+    root = _repo_root(repo_root)
+    claimed = _lexical_absolute(claimed)
+    with state_lock(root) as held:
+        return _create_scout_receipt_unlocked(root, claimed, identity, held)
 
 
-def _create_scout_receipt_unlocked(repo_root: Path, claimed: Path, identity: ProposalIdentity) -> Path:
-    """Reserve one receipt while the Foundry state lock is already held."""
-    receipts = _scout_receipt_root(repo_root)
-    try:
-        entries = list(receipts.iterdir())
-    except OSError as error:
-        raise CandidateError("Scout receipt quarantine could not be listed") from error
-    if len(entries) >= SCOUT_RECEIPT_LIMIT:
+def _create_scout_receipt_unlocked(repo_root: Path, claimed: Path, identity: ProposalIdentity,
+                                   held: _HeldStateLock) -> Path:
+    """Reserve one direct-state receipt while the exact state lock is held."""
+    if held.state_root != _state_root(repo_root):
+        raise CandidateError("Scout receipt lock does not match the repository state directory")
+    claimed_name = _claimed_name_in_held_state(claimed, held)
+    if len(_posix_receipt_entries(held)) >= SCOUT_RECEIPT_LIMIT:
         raise CandidateError("Scout receipt quarantine is full; operator recovery is required")
-    for entry in entries:
-        try:
-            entry_stat = entry.lstat()
-        except OSError as error:
-            raise CandidateError("Scout receipt quarantine contains an unreadable entry") from error
-        if entry.is_symlink() or not stat.S_ISREG(entry_stat.st_mode):
-            raise CandidateError("Scout receipt quarantine contains an unsafe entry")
-
     for _ in range(8):
-        receipt = receipts / f"{identity[-1]}-{uuid.uuid4().hex}.json"
+        receipt_name = _receipt_name(identity)
         try:
-            os.link(claimed, receipt, follow_symlinks=False)
+            os.link(
+                claimed_name,
+                receipt_name,
+                src_dir_fd=held.descriptor,
+                dst_dir_fd=held.descriptor,
+                follow_symlinks=False,
+            )
         except FileExistsError:
             continue
         except (NotImplementedError, OSError) as error:
             raise CandidateError("Scout receipt quarantine cannot safely retain this proposal") from error
-        if not _proposal_matches_identity(claimed, identity) or not _proposal_matches_identity(receipt, identity):
+        # The hard link is already anchored in the retained directory.  Do not
+        # return a lexical receipt path if the state name was swapped while it
+        # was reserved; the caller must fail closed and recover through the
+        # retained descriptor transaction instead.
+        _assert_held_state_path(held)
+        if not (
+            _proposal_matches_identity_at(claimed_name, held.descriptor, identity)
+            and _proposal_matches_identity_at(receipt_name, held.descriptor, identity)
+        ):
             raise CandidateError("Scout proposal changed before durable receipt creation")
-        return receipt
+        return held.state_root / receipt_name
     raise CandidateError("Scout receipt quarantine could not reserve a durable receipt")
+
+
+def _restore_scout_claim(held: _HeldStateLock, proposal_name: str, claimed_name: str) -> None:
+    """Restore one unconsumed claim without consulting a swapped state pathname."""
+    try:
+        claimed = os.stat(claimed_name, dir_fd=held.descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise CandidateError("Scout claim could not be recovered safely") from error
+    if _is_link_or_reparse(Path(claimed_name), claimed) or not stat.S_ISREG(claimed.st_mode):
+        raise CandidateError("Scout claim could not be recovered safely")
+    try:
+        os.stat(proposal_name, dir_fd=held.descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            os.link(
+                claimed_name,
+                proposal_name,
+                src_dir_fd=held.descriptor,
+                dst_dir_fd=held.descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            return
+        except OSError as error:
+            raise CandidateError("Scout claim could not be restored safely") from error
+        try:
+            os.unlink(claimed_name, dir_fd=held.descriptor)
+        except OSError as error:
+            raise CandidateError("Scout claim could not be restored safely") from error
 
 
 def stage_candidate_file(repo_root: str | Path, candidate_path: str | Path, *, consume: bool = False) -> dict[str, Any]:
@@ -726,30 +1064,34 @@ def stage_candidate_file(repo_root: str | Path, candidate_path: str | Path, *, c
     if not consume:
         return stage_candidate(root, _load_candidate_file(proposal))
 
-    claimed = _claim_scout_proposal(proposal)
-    try:
-        candidate, identity = _load_regular_candidate_file(claimed)
-        _create_scout_receipt(root, claimed, identity)
-        result = stage_candidate(root, candidate)
+    with state_lock(root) as held:
+        _assert_held_state_path(held)
+        claimed = _claim_scout_proposal(proposal, held)
+        claimed_name = claimed.name
         try:
-            if not _proposal_matches_identity(claimed, identity):
+            candidate, identity = _load_regular_candidate_file_at(claimed_name, held.descriptor)
+            _assert_held_state_path(held)
+            _create_scout_receipt_unlocked(root, claimed, identity, held)
+            validated = validate_candidate(candidate)
+            result = _stage_candidate_unlocked(
+                root,
+                validated,
+                candidate_sha256(validated),
+                chicago_date(),
+                held,
+            )
+            _assert_held_state_path(held)
+            if not _proposal_matches_identity_at(claimed_name, held.descriptor, identity):
                 raise CandidateError("Scout proposal changed before it could be consumed")
             # The durable hard-linked receipt still names this inode, so this
-            # removes only the transient claim path, never held producer data.
-            claimed.unlink()
-        except FileNotFoundError as error:
-            raise CandidateError("Scout proposal disappeared before it could be consumed") from error
-        return result
-    except Exception:
-        # Preserve the original handoff if nothing newer has appeared at the
-        # approved path.  If a newer proposal exists, never replace or delete
-        # it; the claimed file remains for explicit recovery instead.
-        try:
-            proposal.lstat()
-        except FileNotFoundError:
-            if claimed.exists() or claimed.is_symlink():
-                os.replace(claimed, proposal)
-        raise
+            # removes only the transient claim path.
+            os.unlink(claimed_name, dir_fd=held.descriptor)
+            return result
+        except Exception:
+            # Recovery stays inside the original retained state directory. A
+            # newer proposal in that directory always wins over the claim.
+            _restore_scout_claim(held, proposal.name, claimed_name)
+            raise
 
 
 def _ledger_unlocked(repo_root: Path) -> list[dict[str, Any]]:

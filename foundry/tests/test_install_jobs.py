@@ -149,7 +149,7 @@ class InstallerPlanningTests(unittest.TestCase):
         self.assertEqual(builder.prompt, (ROOT / "foundry" / "prompts" / "BUILDER.md").read_text(encoding="utf-8").rstrip())
         for phrase in (
             "scout-candidate.json",
-            "scout-receipts",
+            ".scout-receipt-",
             "(cd .. && python3 -m foundry.src.orchestrator stage-candidate --candidate foundry/state/scout-candidate.json --consume)",
             "at most one",
             "Never build",

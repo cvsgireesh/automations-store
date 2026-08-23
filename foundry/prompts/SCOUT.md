@@ -26,11 +26,17 @@ through:
 (cd .. && python3 -m foundry.src.orchestrator stage-candidate --candidate foundry/state/scout-candidate.json --consume)
 ```
 
+Run this state-changing handoff only on the Mac/POSIX authority host. Windows
+is a product-compatibility target and deliberately fails closed before any
+Foundry state claim, receipt, or staging write; stop there and request a Mac
+authority-host handoff instead of retrying it on Windows.
+
 The command atomically claims that exact proposal path and keeps a durable,
-bounded ignored receipt under `foundry/state/scout-receipts` before staging.
-Write only the approved proposal path; never write, alter, or delete a claim
-or receipt. If the receipt quarantine is full, stop and request operator
-recovery rather than replacing or deleting any receipt.
+bounded ignored receipt named `.scout-receipt-<sha256>-<uuid>.json` directly
+under `foundry/state` before staging. Write only the approved proposal path;
+never write, alter, or delete a claim or receipt. If the receipt quarantine is
+full, stop and request operator recovery rather than replacing or deleting any
+receipt.
 
 Never build, package, publish, upload, message buyers, access credentials,
 configure payouts, copy third-party work, change payment settings, run

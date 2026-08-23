@@ -39,8 +39,9 @@ compatible license and a matching `THIRD_PARTY_NOTICES.md` entry.
 Use `python3 -m foundry.src.orchestrator` for deterministic state changes.
 From the scheduled `<repo>/foundry` workdir, invoke it as
 `(cd .. && python3 -m foundry.src.orchestrator ...)` so the repository package
-is importable. No-op runs are successful and silent. Keep heavy local-model
-work serialized on the Mac; `home-windows` is a compatibility target, not the
-primary inference host. Gumroad payout onboarding and final publication
-require the account owner and action-time confirmation, so they are never
-automated.
+is importable. The Mac/POSIX authority host retains no-follow directory
+descriptors for the Scout handoff transaction; `home-windows` is limited to
+pure product compatibility and fails closed before Foundry state mutation.
+No-op runs are successful and silent. Keep heavy local-model work serialized
+on the Mac. Gumroad payout onboarding and final publication require the account
+owner and action-time confirmation, so they are never automated.

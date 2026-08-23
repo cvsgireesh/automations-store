@@ -81,11 +81,13 @@ def new_candidate(slug: str = "operator-kit") -> dict:
     }
 
 
+@unittest.skipIf(os.name == "nt", "mutable Foundry authority state requires the POSIX descriptor-bound host")
 class OrchestratorTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
-        (self.root / "foundry" / "state").mkdir(parents=True)
+        state = self.root / "foundry" / "state"
+        state.mkdir(parents=True)
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -119,6 +121,11 @@ class OrchestratorTests(unittest.TestCase):
                 "status": "ready",
             },
         )
+
+    def scout_receipts(self, state_root: Path | None = None) -> list[Path]:
+        """Return only durable direct-state receipt entries, not claims or locks."""
+        root = state_root if state_root is not None else self.root / "foundry" / "state"
+        return sorted(root.glob(".scout-receipt-*.json"))
 
     def write_packagable_product(self, slug: str = "hermes-hybrid-operator-kit", *,
                                  version: str = "1.0.0", test_body: str | None = None,
@@ -173,25 +180,125 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"a": [2], "z": 1})
         self.assertEqual(list(target.parent.glob(f".{target.name}.*.tmp")), [])
 
-    def test_state_lock_uses_a_windows_byte_lock_when_fcntl_is_unavailable(self):
+    def test_windows_authority_candidate_mutation_fails_closed_without_directory_relative_io(self):
+        """A Windows path lock is not authority to alter Scout/Builder state.
+
+        The standard library cannot make Windows claim/stage writes immune to
+        an ancestor-entry rename, so the control plane rejects them before
+        state access. The authority host is the POSIX descriptor-bound builder,
+        rather than a best-effort Windows pathname transaction.
+        """
         from foundry.src import orchestrator
 
-        calls: list[tuple[int, int]] = []
+        state = self.root / "foundry" / "state"
+        proposal = state / "scout-candidate.json"
+        proposal.write_text(json.dumps(new_candidate("windows-authority-kit")), encoding="utf-8")
+        original_proposal = proposal.read_bytes()
+        with mock.patch.object(orchestrator, "fcntl", None):
+            with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+                stage_candidate(self.root, new_candidate("windows-authority-kit"))
+            with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+                stage_candidate_file(self.root, proposal, consume=True)
+        self.assertFalse((state / "candidate.json").exists())
+        self.assertEqual(proposal.read_bytes(), original_proposal)
 
-        class FakeMsvcrt:
-            LK_NBLCK = 1
-            LK_UNLCK = 2
+    @unittest.skipIf(os.name == "nt", "POSIX directory descriptors are required")
+    def test_posix_state_lock_survives_legacy_lock_path_replacement(self):
+        """Replacing a legacy file cannot split a directory-FD state lock."""
+        from foundry.src import orchestrator
 
-            @staticmethod
-            def locking(_descriptor, mode, length):
-                calls.append((mode, length))
+        state = self.root / "foundry" / "state"
+        legacy_lock = state / ".lock"
+        legacy_lock.write_bytes(b"old")
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        errors: list[BaseException] = []
 
-        with mock.patch.object(orchestrator, "fcntl", None), mock.patch.object(
-            orchestrator, "msvcrt", FakeMsvcrt, create=True
-        ):
-            with orchestrator.state_lock(self.root):
-                self.assertTrue((self.root / "foundry" / "state" / ".lock").is_file())
-        self.assertEqual(calls, [(FakeMsvcrt.LK_NBLCK, 1), (FakeMsvcrt.LK_UNLCK, 1)])
+        def first_holder():
+            try:
+                with orchestrator.state_lock(self.root):
+                    first_entered.set()
+                    release_first.wait(timeout=5)
+            except BaseException as error:
+                errors.append(error)
+
+        def second_holder():
+            try:
+                with orchestrator.state_lock(self.root):
+                    second_entered.set()
+            except BaseException as error:
+                errors.append(error)
+
+        first = threading.Thread(target=first_holder)
+        first.start()
+        self.assertTrue(first_entered.wait(timeout=3))
+        legacy_lock.unlink()
+        legacy_lock.write_bytes(b"replacement")
+        second = threading.Thread(target=second_holder)
+        second.start()
+        try:
+            self.assertFalse(second_entered.wait(timeout=0.25))
+        finally:
+            release_first.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(second_entered.is_set())
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory descriptors are required")
+    def test_posix_state_lock_survives_state_directory_replacement(self):
+        """A replacement state directory cannot create a second lock domain."""
+        from foundry.src import orchestrator
+
+        state = self.root / "foundry" / "state"
+        original_state = self.root / "foundry" / "state-original"
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        errors: list[BaseException] = []
+
+        def holder(event: threading.Event, release: threading.Event | None = None):
+            try:
+                with orchestrator.state_lock(self.root):
+                    event.set()
+                    if release is not None:
+                        release.wait(timeout=5)
+            except BaseException as error:
+                errors.append(error)
+
+        first = threading.Thread(target=holder, args=(first_entered, release_first))
+        first.start()
+        self.assertTrue(first_entered.wait(timeout=3))
+        os.replace(state, original_state)
+        state.mkdir()
+        second = threading.Thread(target=holder, args=(second_entered,))
+        second.start()
+        try:
+            self.assertFalse(second_entered.wait(timeout=0.25))
+        finally:
+            release_first.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+            if state.exists() and not state.is_symlink():
+                state.rmdir()
+            if original_state.exists():
+                os.replace(original_state, state)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(second_entered.is_set())
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory descriptors are required")
+    def test_posix_state_lock_never_follows_a_legacy_lock_symlink(self):
+        from foundry.src import orchestrator
+
+        outside = self.root / "outside-lock"
+        outside.write_bytes(b"")
+        (self.root / "foundry" / "state" / ".lock").symlink_to(outside)
+        with orchestrator.state_lock(self.root):
+            pass
+        self.assertEqual(outside.read_bytes(), b"")
 
     def test_collection_uses_fixtures_and_preserves_last_good_signals_on_failure(self):
         config = json.loads((REPO_ROOT / "foundry" / "config.json").read_text(encoding="utf-8"))
@@ -339,9 +446,9 @@ class OrchestratorTests(unittest.TestCase):
         result = stage_candidate_file(self.root, proposal, consume=True)
         self.assertEqual(result["status"], "staged")
         self.assertFalse(proposal.exists())
-        receipts = list((self.root / "foundry" / "state" / "scout-receipts").glob("*.json"))
+        receipts = self.scout_receipts()
         self.assertEqual(len(receipts), 1)
-        self.assertTrue(receipts[0].name.startswith(hashlib.sha256(original_bytes).hexdigest()))
+        self.assertTrue(receipts[0].name.startswith(f".scout-receipt-{hashlib.sha256(original_bytes).hexdigest()}-"))
         self.assertEqual(receipts[0].read_bytes(), original_bytes)
         other = self.root / "candidate.json"
         other.write_text(json.dumps(new_candidate("other-kit")), encoding="utf-8")
@@ -358,6 +465,76 @@ class OrchestratorTests(unittest.TestCase):
             stage_candidate_file(self.root, proposal, consume=True)
         self.assertTrue(proposal.is_symlink())
         self.assertTrue(target.is_file())
+
+    def test_scout_proposal_reparse_point_is_never_claimed(self):
+        """Windows file reparse points fail before a claim can move them."""
+        proposal = self.root / "foundry" / "state" / "scout-candidate.json"
+        proposal.write_text(json.dumps(new_candidate()), encoding="utf-8")
+        from foundry.src import orchestrator
+
+        original_reparse = orchestrator._is_reparse_point
+
+        def proposal_is_reparse(path, details=None):
+            if Path(path).name == proposal.name:
+                return True
+            return original_reparse(path, details)
+
+        with mock.patch.object(orchestrator, "_is_reparse_point", side_effect=proposal_is_reparse):
+            with self.assertRaisesRegex(CandidateError, "regular file"):
+                stage_candidate_file(self.root, proposal, consume=True)
+        self.assertTrue(proposal.is_file())
+
+    @unittest.skipIf(os.name == "nt", "FD-relative POSIX claim operations are required")
+    def test_posix_scout_claim_never_relocates_an_outside_proposal_during_state_swap(self):
+        """A swap before the claim cannot move an outside proposal into a claim."""
+        from foundry.src import orchestrator
+
+        state = self.root / "foundry" / "state"
+        original_state = self.root / "foundry" / "state-original"
+        outside = self.root / "outside-state"
+        outside.mkdir()
+        proposal = state / "scout-candidate.json"
+        proposal.write_text(json.dumps(new_candidate("local-kit")), encoding="utf-8")
+        outside_proposal = outside / proposal.name
+        outside_proposal.write_text(json.dumps(new_candidate("outside-kit")), encoding="utf-8")
+        original_replace = os.replace
+        original_rename = os.rename
+        swapped = False
+
+        def swap_state() -> None:
+            nonlocal swapped
+            if swapped:
+                return
+            swapped = True
+            original_replace(state, original_state)
+            state.symlink_to(outside, target_is_directory=True)
+
+        def replace_with_swap(source, destination, *args, **kwargs):
+            if not swapped and Path(source).name == proposal.name:
+                swap_state()
+                result = original_replace(source, destination, *args, **kwargs)
+                outside_proposal.write_text(json.dumps(new_candidate("newer-outside-kit")), encoding="utf-8")
+                return result
+            return original_replace(source, destination, *args, **kwargs)
+
+        def rename_with_swap(source, destination, *args, **kwargs):
+            if not swapped and source == proposal.name and kwargs.get("src_dir_fd") is not None:
+                swap_state()
+            return original_rename(source, destination, *args, **kwargs)
+
+        try:
+            with mock.patch.object(orchestrator.os, "replace", side_effect=replace_with_swap), mock.patch.object(
+                orchestrator.os, "rename", side_effect=rename_with_swap
+            ):
+                with self.assertRaises((CandidateError, orchestrator.FoundryError)):
+                    stage_candidate_file(self.root, proposal, consume=True)
+            self.assertEqual(list(outside.glob(".scout-candidate.json.claim-*")), [])
+            self.assertTrue(outside_proposal.is_file())
+        finally:
+            if state.is_symlink():
+                state.unlink()
+            if original_state.exists():
+                os.replace(original_state, state)
 
     def test_scout_handoff_command_works_from_the_foundry_job_workdir(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -571,25 +748,68 @@ class OrchestratorTests(unittest.TestCase):
         proposal.write_text(json.dumps(new_candidate("first-kit")), encoding="utf-8")
         from foundry.src import orchestrator
 
-        original_stage = orchestrator.stage_candidate
+        original_stage = orchestrator._stage_candidate_unlocked
 
-        def stage_then_replace(root, payload):
-            result = original_stage(root, payload)
+        def stage_then_replace(*args):
+            result = original_stage(*args)
             proposal.write_text(json.dumps(new_candidate("second-kit")), encoding="utf-8")
             return result
 
-        with mock.patch.object(orchestrator, "stage_candidate", side_effect=stage_then_replace):
+        with mock.patch.object(orchestrator, "_stage_candidate_unlocked", side_effect=stage_then_replace):
             result = stage_candidate_file(self.root, proposal, consume=True)
         self.assertEqual(result["status"], "staged")
         self.assertTrue(proposal.exists())
         self.assertEqual(json.loads(proposal.read_text(encoding="utf-8"))["slug"], "second-kit")
+
+    @unittest.skipIf(os.name == "nt", "FD-relative POSIX restoration is required")
+    def test_failed_claim_restore_never_overwrites_a_newer_proposal(self):
+        """A producer racing recovery retains its newer proposal atomically."""
+        proposal = self.root / "foundry" / "state" / "scout-candidate.json"
+        proposal.write_text(json.dumps(new_candidate("first-kit")), encoding="utf-8")
+        from foundry.src import orchestrator
+
+        original_rename = os.rename
+        original_link = os.link
+        injected = False
+
+        def write_newer(directory_fd: int) -> None:
+            descriptor = os.open(
+                proposal.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+                target.write(json.dumps(new_candidate("newer-kit")))
+
+        def rename_with_newer(source, destination, *args, **kwargs):
+            nonlocal injected
+            if not injected and source.startswith(".scout-candidate.json.claim-") and destination == proposal.name:
+                injected = True
+                write_newer(kwargs["dst_dir_fd"])
+            return original_rename(source, destination, *args, **kwargs)
+
+        def link_with_newer(source, destination, *args, **kwargs):
+            nonlocal injected
+            if not injected and source.startswith(".scout-candidate.json.claim-") and destination == proposal.name:
+                injected = True
+                write_newer(kwargs["dst_dir_fd"])
+            return original_link(source, destination, *args, **kwargs)
+
+        with mock.patch.object(orchestrator, "_stage_candidate_unlocked", side_effect=CandidateError("abort")), mock.patch.object(
+            orchestrator.os, "rename", side_effect=rename_with_newer
+        ), mock.patch.object(orchestrator.os, "link", side_effect=link_with_newer):
+            with self.assertRaisesRegex(CandidateError, "abort"):
+                stage_candidate_file(self.root, proposal, consume=True)
+        self.assertTrue(injected)
+        self.assertEqual(json.loads(proposal.read_text(encoding="utf-8"))["slug"], "newer-kit")
 
     def test_held_descriptor_rewrite_of_claimed_proposal_is_preserved_not_deleted(self):
         proposal = self.root / "foundry" / "state" / "scout-candidate.json"
         proposal.write_text(json.dumps(new_candidate("first-kit")), encoding="utf-8")
         from foundry.src import orchestrator
 
-        original_stage = orchestrator.stage_candidate
+        original_stage = orchestrator._stage_candidate_unlocked
         with proposal.open("r+", encoding="utf-8") as producer:
             if os.name == "nt":
                 # Windows denies the atomic rename while a producer opens the
@@ -600,8 +820,8 @@ class OrchestratorTests(unittest.TestCase):
                 self.assertEqual(json.loads(proposal.read_text(encoding="utf-8"))["slug"], "first-kit")
                 return
 
-            def stage_then_rewrite(root, payload):
-                result = original_stage(root, payload)
+            def stage_then_rewrite(*args):
+                result = original_stage(*args)
                 producer.seek(0)
                 producer.write(json.dumps(new_candidate("second-kit")))
                 producer.truncate()
@@ -609,7 +829,7 @@ class OrchestratorTests(unittest.TestCase):
                 os.fsync(producer.fileno())
                 return result
 
-            with mock.patch.object(orchestrator, "stage_candidate", side_effect=stage_then_rewrite):
+            with mock.patch.object(orchestrator, "_stage_candidate_unlocked", side_effect=stage_then_rewrite):
                 with self.assertRaisesRegex(CandidateError, "changed"):
                     stage_candidate_file(self.root, proposal, consume=True)
         self.assertTrue(proposal.exists())
@@ -620,7 +840,9 @@ class OrchestratorTests(unittest.TestCase):
         original_bytes = json.dumps(new_candidate("first-kit")).encode("utf-8")
         replacement_bytes = json.dumps(new_candidate("second-kit")).encode("utf-8")
         proposal.write_bytes(original_bytes)
-        original_unlink = Path.unlink
+        from foundry.src import orchestrator
+
+        original_unlink = os.unlink
         with proposal.open("r+b") as producer:
             if os.name == "nt":
                 # Native Windows rejects the producer-held rename, so no
@@ -628,11 +850,11 @@ class OrchestratorTests(unittest.TestCase):
                 with self.assertRaisesRegex(CandidateError, "claimed atomically"):
                     stage_candidate_file(self.root, proposal, consume=True)
                 self.assertEqual(proposal.read_bytes(), original_bytes)
-                self.assertFalse((self.root / "foundry" / "state" / "scout-receipts").exists())
+                self.assertEqual(self.scout_receipts(), [])
                 return
 
             def rewrite_then_unlink(path, *args, **kwargs):
-                if ".scout-candidate.json.claim-" in path.name:
+                if ".scout-candidate.json.claim-" in Path(path).name:
                     producer.seek(0)
                     producer.write(replacement_bytes)
                     producer.truncate()
@@ -640,22 +862,21 @@ class OrchestratorTests(unittest.TestCase):
                     os.fsync(producer.fileno())
                 return original_unlink(path, *args, **kwargs)
 
-            with mock.patch.object(Path, "unlink", new=rewrite_then_unlink):
+            with mock.patch.object(orchestrator.os, "unlink", side_effect=rewrite_then_unlink):
                 result = stage_candidate_file(self.root, proposal, consume=True)
         self.assertEqual(result["status"], "staged")
         self.assertFalse(proposal.exists())
-        receipts = list((self.root / "foundry" / "state" / "scout-receipts").glob("*.json"))
+        receipts = self.scout_receipts()
         self.assertEqual(len(receipts), 1)
-        self.assertTrue(receipts[0].name.startswith(hashlib.sha256(original_bytes).hexdigest()))
+        self.assertTrue(receipts[0].name.startswith(f".scout-receipt-{hashlib.sha256(original_bytes).hexdigest()}-"))
         self.assertEqual(receipts[0].read_bytes(), replacement_bytes)
 
     def test_full_receipt_quarantine_refuses_consumption_and_preserves_the_proposal(self):
         proposal = self.root / "foundry" / "state" / "scout-candidate.json"
         proposal.write_text(json.dumps(new_candidate()), encoding="utf-8")
-        receipts = self.root / "foundry" / "state" / "scout-receipts"
-        receipts.mkdir()
+        state = self.root / "foundry" / "state"
         for number in range(32):
-            (receipts / f"{number:064x}.json").write_text("{}", encoding="utf-8")
+            (state / f".scout-receipt-{number:064x}.json").write_text("{}", encoding="utf-8")
         with self.assertRaisesRegex(CandidateError, "receipt quarantine"):
             stage_candidate_file(self.root, proposal, consume=True)
         self.assertTrue(proposal.is_file())
@@ -664,10 +885,9 @@ class OrchestratorTests(unittest.TestCase):
         """Two fresh handoffs cannot both reserve the final receipt slot."""
         from foundry.src import orchestrator
 
-        receipts = self.root / "foundry" / "state" / "scout-receipts"
-        receipts.mkdir()
+        receipts = self.root / "foundry" / "state"
         for number in range(31):
-            (receipts / f"{number:064x}.json").write_text("{}", encoding="utf-8")
+            (receipts / f".scout-receipt-{number:064x}.json").write_text("{}", encoding="utf-8")
         claims = []
         for name in ("first", "second"):
             claim = self.root / "foundry" / "state" / f".{name}.claim"
@@ -715,7 +935,48 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], CandidateError)
-        self.assertEqual(len(list(receipts.glob("*.json"))), 32)
+        self.assertEqual(len(self.scout_receipts()), 32)
+
+    @unittest.skipIf(os.name == "nt", "FD-relative receipt operations are required")
+    def test_posix_receipt_stays_in_the_verified_state_directory_during_path_swap(self):
+        """A state-path replacement cannot redirect a held directory-FD receipt."""
+        from foundry.src import orchestrator
+
+        state = self.root / "foundry" / "state"
+        original_state = self.root / "foundry" / "state-original"
+        outside = self.root / "outside-state"
+        outside.mkdir()
+        claim = state / ".candidate.claim"
+        raw = json.dumps(new_candidate("swap-kit")).encode("utf-8")
+        claim.write_bytes(raw)
+        # The vulnerable pathname implementation re-resolves both source and
+        # destination after the swap.  Populate its alternate lookup path so
+        # the test catches a successful redirect rather than just an error.
+        os.link(claim, outside / claim.name)
+        (outside / "scout-receipts").mkdir()
+        _, identity = orchestrator._read_regular_candidate_bytes(claim)
+        original_link = os.link
+        swapped = False
+
+        def swap_before_link(source, destination, *args, **kwargs):
+            nonlocal swapped
+            if not swapped:
+                os.replace(state, original_state)
+                state.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return original_link(source, destination, *args, **kwargs)
+
+        try:
+            with self.assertRaisesRegex(CandidateError, "state directory changed"):
+                with mock.patch.object(orchestrator.os, "link", side_effect=swap_before_link):
+                    orchestrator._create_scout_receipt(self.root, claim, identity)
+            self.assertEqual(list(outside.rglob("*.json")), [])
+            self.assertEqual(len(self.scout_receipts(original_state)), 1)
+        finally:
+            if state.is_symlink():
+                state.unlink()
+            if original_state.exists():
+                os.replace(original_state, state)
 
     @POSIX_SNAPSHOT_REQUIRED
     def test_package_writes_verified_manifest_and_truthful_listing_without_publication(self):
@@ -1055,6 +1316,88 @@ class OrchestratorTests(unittest.TestCase):
     def test_latest_signals_reads_only_normalized_state(self):
         self.write_signals(accepted_signals())
         self.assertEqual([item.signal_id for item in latest_signals(self.root)], ["paid", "release", "adoption"])
+
+
+@unittest.skipUnless(os.name == "nt", "requires native Windows state-path semantics")
+class WindowsStateBoundaryTests(unittest.TestCase):
+    """Windows deliberately never enters the mutable Foundry control plane."""
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        (self.root / "foundry").mkdir()
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def test_state_lock_fails_before_creating_a_missing_state_directory(self):
+        from foundry.src import orchestrator
+
+        state = self.root / "foundry" / "state"
+        with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+            with orchestrator.state_lock(self.root):
+                pass
+        self.assertFalse(state.exists())
+
+    def test_collect_fails_before_fetch_or_state_write(self):
+        from foundry.src import orchestrator
+
+        with mock.patch.object(orchestrator, "collect") as fetched:
+            with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+                collect_signals(self.root, "2026-08-23", config={})
+        fetched.assert_not_called()
+        self.assertFalse((self.root / "foundry" / "state").exists())
+
+    def test_consume_leaves_the_approved_proposal_and_state_untouched(self):
+        from foundry.src import orchestrator
+
+        state = self.root / "foundry" / "state"
+        state.mkdir()
+        proposal = state / "scout-candidate.json"
+        proposal.write_text(json.dumps(new_candidate("windows-boundary-kit")), encoding="utf-8")
+        original = proposal.read_bytes()
+        with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+            stage_candidate_file(self.root, proposal, consume=True)
+        self.assertEqual(proposal.read_bytes(), original)
+        self.assertFalse((state / "current-candidate.json").exists())
+        self.assertFalse((state / ".lock").exists())
+        self.assertEqual(list(state.glob(".scout-receipt-*.json")), [])
+
+    def test_state_junction_and_two_link_lock_are_untouched(self):
+        from foundry.src import orchestrator
+
+        state = self.root / "foundry" / "state"
+        outside = self.root / "outside"
+        outside.mkdir()
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", f'mklink /J "{state}" "{outside}"'],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        try:
+            with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+                with orchestrator.state_lock(self.root):
+                    pass
+            self.assertFalse((outside / ".lock").exists())
+        finally:
+            os.rmdir(state)
+
+        state.mkdir()
+        lock = state / ".lock"
+        second_link = self.root / "second-lock-link"
+        lock.write_bytes(b"retained")
+        os.link(lock, second_link)
+        try:
+            with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+                with orchestrator.state_lock(self.root):
+                    pass
+            self.assertEqual(lock.read_bytes(), b"retained")
+            self.assertEqual(second_link.read_bytes(), b"retained")
+            self.assertGreaterEqual(lock.stat().st_nlink, 2)
+        finally:
+            second_link.unlink()
 
 
 if __name__ == "__main__":
