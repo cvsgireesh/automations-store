@@ -7,15 +7,25 @@ const PRODUCT = Object.freeze({
 
 const isGumroadProductUrl = (value) => {
   try {
+    if (typeof value !== 'string' || value !== value.trim()) return false;
     const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    const isGumroadHost = hostname === 'gumroad.com' || hostname.endsWith('.gumroad.com');
+    const productPath = /^\/l\/([A-Za-z0-9][A-Za-z0-9_-]*)$/.test(url.pathname);
     return url.protocol === 'https:'
-      && (url.hostname === 'gumroad.com' || url.hostname.endsWith('.gumroad.com'));
+      && !url.username
+      && !url.password
+      && !url.port
+      && !url.search
+      && !url.hash
+      && isGumroadHost
+      && productPath;
   } catch {
     return false;
   }
 };
 
-const checkoutIsOpen = isGumroadProductUrl(PRODUCT.checkoutUrl);
+const checkoutIsOpen = PRODUCT.status === 'ready' && isGumroadProductUrl(PRODUCT.checkoutUrl);
 
 document.querySelectorAll('[data-checkout-cta]').forEach((cta) => {
   if (checkoutIsOpen) {

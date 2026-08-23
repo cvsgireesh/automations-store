@@ -13,7 +13,7 @@ This is a dependency-free static storefront for one pre-release product: the Her
 
 The kit describes a Generator, redacted preflight, safe installers, routing and rollback checklists, and four failure drills. It does not make production-performance, customer, cost-saving, or availability claims.
 
-The free architecture repository is separate from this product. HermesPacks is not affiliated with Hermes Agent, its maintainers, or its contributors.
+The [free architecture repository](https://github.com/Dennis-Gireesh/hermes-hybrid-agent-router) is separate from this product. Independent product with no relationship to Nous Research or OpenAI.
 
 ## Local check
 
