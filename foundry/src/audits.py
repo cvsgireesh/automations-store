@@ -12,6 +12,39 @@ FORBIDDEN_CLAIMS = {
     "unsupported_social_proof": re.compile(r"\b(?:hundreds|thousands) of (?:developers|customers|users)\b", re.I),
     "unsupported_bestseller": re.compile(r"\bbest[ -]?seller\b", re.I),
     "unsupported_lifetime": re.compile(r"\blifetime updates?\b", re.I),
+    "unsupported_testimonial": re.compile(
+        r"\b(?:a\s+)?(?:buyer|customer|user)\s+(?:says|said|writes|wrote|reports|reported)\b"
+        r"|<(?:testimonial|review)\b"
+        r"|(?:class|id|data-[\w-]+)\s*=\s*['\"][^'\"]*\b(?:testimonial|review)s?\b",
+        re.I,
+    ),
+    "unsupported_customer_count": re.compile(r"\b\d[\d,]*(?:\.\d+)?\+?\s+(?:customers?|users?|buyers?)\b", re.I),
+    "unsupported_sales_figure": re.compile(
+        r"\b\d[\d,]*(?:\.\d+)?\+?\s+(?:sales|sold)\b"
+        r"|\$\d[\d,]*(?:\.\d+)?\s+(?:in\s+)?(?:revenue|earnings?)\b"
+        r"|\b(?:revenue|earnings?)\s+(?:of\s+)?\$?\d[\d,]*(?:\.\d+)?\b",
+        re.I,
+    ),
+    "unsupported_rating_claim": re.compile(
+        r"\b(?:rated|rating\s+of|rated\s+at)\s+\d(?:\.\d)?\s*(?:out\s+of\s+\d(?:\.\d)?\s*)?(?:stars?|/\s*5)\b"
+        r"|\b\d(?:\.\d)?\s*stars?\b",
+        re.I,
+    ),
+    "unsupported_discount_claim": re.compile(
+        r"\b(?:save|sale|discount(?:ed)?)\s+(?:of\s+)?\d+(?:\.\d+)?%"
+        r"|\b\d+(?:\.\d+)?%\s*off\b"
+        r"|<(?:s|strike|del)\b[^>]*>\s*\$?\d",
+        re.I,
+    ),
+    "unsupported_benchmark": re.compile(
+        r"\b\d+(?:\.\d+)?\s*x\s+(?:faster|slower|cheaper|more\s+efficient)\b"
+        r"|\$\d+(?:\.\d+)?\s*(?:per|/)\s*\w+"
+        r"|\b(?:in\s+)?\d+(?:\.\d+)?\s*(?:ms|milliseconds|seconds?)\b"
+        r"|\b\d+(?:\.\d+)?%\s+(?:accuracy|faster|slower|cheaper|reduction|improvement)\b"
+        r"|\b\d[\d,]*\s+(?:requests?|jobs?|tasks?)\s+per\s+(?:second|minute|hour)\b",
+        re.I,
+    ),
+    "unsupported_affiliation_claim": re.compile(r"\b(?:official(?:ly)?|partnered|certified|endorsed)\b", re.I),
 }
 SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
@@ -20,8 +53,10 @@ SECRET_PATTERNS = (
 )
 PLACEHOLDER_PATTERN = re.compile(r"\bYOUR_[A-Z0-9_]+\b")
 SENSITIVE_NAME_PATTERN = re.compile(r"(?:^|[._-])(?:auth|session|state)(?:$|[._-])", re.I)
-THIRD_PARTY_DIRECTORY_NAMES = {"third_party", "third-party", "thirdparty", "vendor", "vendors"}
-NOTICE_NAMES = {"notice", "notice.txt", "third_party_notices", "third-party-notices"}
+THIRD_PARTY_DIRECTORY_NAMES = {"third_party", "vendor"}
+COMPATIBLE_LICENSES = {"MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "CC0-1.0"}
+NOTICE_FILE_NAME = "THIRD_PARTY_NOTICES.md"
+NOTICE_SECTION_PATTERN = re.compile(r"^##\s+(.+?)\s*$", re.M)
 
 
 @dataclass(frozen=True)
@@ -55,11 +90,60 @@ def _is_binary(content: bytes) -> bool:
     return b"\0" in content
 
 
-def _has_notice(directory: Path) -> bool:
-    for candidate in directory.rglob("*"):
-        if candidate.is_file() and candidate.name.casefold() in NOTICE_NAMES:
-            return True
-    return False
+def _third_party_components(source_root: Path) -> set[str]:
+    components: set[str] = set()
+    for directory_name in THIRD_PARTY_DIRECTORY_NAMES:
+        directory = source_root / directory_name
+        if directory.is_dir() and not directory.is_symlink():
+            components.update(child.name for child in directory.iterdir())
+    return components
+
+
+def _notice_entries(notice_text: str) -> tuple[dict[str, tuple[str, str]], set[str], set[str]]:
+    """Parse markdown notice sections into component -> (source URL, license)."""
+    matches = list(NOTICE_SECTION_PATTERN.finditer(notice_text))
+    entries: dict[str, tuple[str, str]] = {}
+    invalid: set[str] = set()
+    duplicates: set[str] = set()
+    for index, match in enumerate(matches):
+        name = match.group(1).strip()
+        if name in entries or name in invalid:
+            duplicates.add(name)
+            continue
+        section_end = matches[index + 1].start() if index + 1 < len(matches) else len(notice_text)
+        section = notice_text[match.end():section_end]
+        source = re.search(r"^\s*(?:[-*]\s*)?Source URL:\s*(https?://\S+)\s*$", section, re.M | re.I)
+        license_name = re.search(r"^\s*(?:[-*]\s*)?License:\s*([^\r\n]+?)\s*$", section, re.M | re.I)
+        if not source or not license_name:
+            invalid.add(name)
+            continue
+        entries[name] = (source.group(1), license_name.group(1).strip().strip("`"))
+    return entries, invalid, duplicates
+
+
+def _audit_third_party_notices(source_root: Path) -> list[AuditFinding]:
+    components = _third_party_components(source_root)
+    if not components:
+        return []
+    notice_path = source_root / NOTICE_FILE_NAME
+    if not notice_path.is_file() or notice_path.is_symlink():
+        return [AuditFinding("missing_third_party_notices", NOTICE_FILE_NAME)]
+    entries, invalid_entries, duplicate_entries = _notice_entries(
+        notice_path.read_text(encoding="utf-8", errors="replace")
+    )
+    findings: list[AuditFinding] = []
+    for component in sorted(components - entries.keys() - invalid_entries):
+        findings.append(AuditFinding("missing_third_party_component_notice", component))
+    for component in sorted(entries.keys() - components):
+        findings.append(AuditFinding("unmatched_third_party_notice", component))
+    for component in sorted(invalid_entries):
+        findings.append(AuditFinding("invalid_third_party_notice", component))
+    for component in sorted(duplicate_entries):
+        findings.append(AuditFinding("duplicate_third_party_notice", component))
+    for component, (_, license_name) in sorted(entries.items()):
+        if component in components and license_name not in COMPATIBLE_LICENSES:
+            findings.append(AuditFinding("incompatible_third_party_license", component, license_name))
+    return findings
 
 
 def audit_tree(root: str | Path) -> list[AuditFinding]:
@@ -69,7 +153,6 @@ def audit_tree(root: str | Path) -> list[AuditFinding]:
         return [AuditFinding("invalid_source_root", source_root.as_posix())]
 
     findings: list[AuditFinding] = []
-    third_party_directories: list[Path] = []
     for current, directories, filenames in os.walk(source_root, followlinks=False):
         current_path = Path(current)
         for directory in sorted(directories):
@@ -77,8 +160,6 @@ def audit_tree(root: str | Path) -> list[AuditFinding]:
             relative_path = directory_path.relative_to(source_root).as_posix()
             if directory_path.is_symlink():
                 findings.append(AuditFinding("symlink", relative_path))
-            elif directory.casefold() in THIRD_PARTY_DIRECTORY_NAMES:
-                third_party_directories.append(directory_path)
         directories[:] = [name for name in directories if not (current_path / name).is_symlink()]
 
         for filename in sorted(filenames):
@@ -96,7 +177,5 @@ def audit_tree(root: str | Path) -> list[AuditFinding]:
                 continue
             findings.extend(audit_text(content.decode("utf-8", errors="replace"), relative_path))
 
-    for directory in third_party_directories:
-        if not _has_notice(directory):
-            findings.append(AuditFinding("missing_third_party_notice", directory.relative_to(source_root).as_posix()))
+    findings.extend(_audit_third_party_notices(source_root))
     return sorted(findings, key=lambda finding: (finding.path, finding.code, finding.detail))

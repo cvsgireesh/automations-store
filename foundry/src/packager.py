@@ -95,31 +95,46 @@ def _manifest_payload(files: dict[str, str], metadata: Mapping[str, Any]) -> byt
     return (json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
+def _repository_root(repo_root: str | Path | None) -> Path:
+    root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parents[2]
+    resolved_root = root.resolve()
+    if not resolved_root.is_dir():
+        raise PackagingError("repo_root must be an existing directory")
+    return resolved_root
+
+
+def _is_strictly_within(path: Path, parent: Path) -> bool:
+    try:
+        return path.relative_to(parent) != Path(".")
+    except ValueError:
+        return False
+
+
 def build_release(source: str | Path, output_zip: str | Path,
-                  metadata: Mapping[str, Any]) -> ReleaseManifest:
+                  metadata: Mapping[str, Any], repo_root: str | Path | None = None) -> ReleaseManifest:
     """Audit and atomically build a byte-for-byte reproducible public ZIP release."""
-    source_root = Path(source)
-    destination = Path(output_zip)
+    source_root = Path(source).resolve()
+    destination = Path(output_zip).resolve()
+    repository_root = _repository_root(repo_root)
     metadata_values, launchers = _validate_metadata(metadata)
+    if not _is_strictly_within(source_root, repository_root / "private-products"):
+        raise PackagingError("source must be strictly within repo_root/private-products")
+    if not _is_strictly_within(destination, repository_root / "dist"):
+        raise PackagingError("output ZIP must be strictly within repo_root/dist")
     findings: list[AuditFinding] = audit_tree(source_root)
     if findings:
         codes = ", ".join(sorted({finding.code for finding in findings}))
         raise PackagingError(f"release audit failed: {codes}")
     if not source_root.is_dir():
         raise PackagingError("source must be a directory")
-    try:
-        destination.resolve().relative_to(source_root.resolve())
-    except ValueError:
-        pass
-    else:
-        raise PackagingError("output ZIP must be outside the source directory")
-
     source_files = _source_files(source_root)
     source_names = {name for name, _ in source_files}
+    manifest_name = "RELEASE-MANIFEST.json"
+    if manifest_name in source_names:
+        raise PackagingError("source must not contain the reserved RELEASE-MANIFEST.json")
     if not launchers.issubset(source_names):
         raise PackagingError("declared launcher is not a source file")
     file_hashes = {name: hashlib.sha256(content).hexdigest() for name, content in source_files}
-    manifest_name = "RELEASE-MANIFEST.json"
     members = source_files + [(manifest_name, _manifest_payload(file_hashes, metadata_values))]
     members.sort(key=lambda member: member[0])
 
