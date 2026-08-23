@@ -13,10 +13,10 @@ import sys
 FORBIDDEN_CLAIMS = {
     "unsupported_social_proof": re.compile(
         r"\b(?:hundreds|thousands) of (?:developers|customers|users)\b"
-        r"|\btrusted\s+by\s+\d[\d,]*(?:\.\d+)?\+?\s+(?:developers?|customers?|users?|buyers?)\b",
+        r"|\b(?:trusted\s+by|join)\s+\d[\d,]*(?:\.\d+)?\+?\s+(?:developers?|customers?|users?|buyers?)\b",
         re.I,
     ),
-    "unsupported_bestseller": re.compile(r"\bbest[ -]?seller\b", re.I),
+    "unsupported_bestseller": re.compile(r"\bbest[ -]?(?:seller|selling)\b", re.I),
     "unsupported_lifetime": re.compile(r"\blifetime updates?\b", re.I),
     "unsupported_testimonial": re.compile(
         r"\b(?:a\s+)?(?:buyer|customer|user)\s+(?:says|said|writes|wrote|reports|reported)\b"
@@ -45,7 +45,7 @@ FORBIDDEN_CLAIMS = {
     "unsupported_urgency_scarcity": re.compile(
         r"\b(?:limited[-\s]?time(?:\s+offer)?|buy\s+now|act\s+now|last\s+chance|"
         r"before\s+(?:midnight|tonight|it'?s\s+gone)|only\s+\d+\s+(?:left|remaining)|"
-        r"while\s+supplies\s+last)\b",
+        r"while\s+supplies\s+last|today\s+only)\b",
         re.I,
     ),
     "unsupported_benchmark": re.compile(
@@ -60,15 +60,14 @@ FORBIDDEN_CLAIMS = {
 }
 ATTRIBUTED_TESTIMONIAL_PATTERN = re.compile(
     r"(?:[\"“][^\"”\r\n]{3,}[\"”])\s*(?:[-–—]|&(?:mdash|ndash);)\s*"
-    r"(?:[A-Z][a-z][A-Za-z.'-]*(?:\s+[A-Z][a-z][A-Za-z.'-]*){1,3}"
+    r"(?:[A-Z][a-z][A-Za-z.'-]*(?:\s+[A-Z][a-z][A-Za-z.'-]*){0,3}"
     r"|@[A-Za-z0-9_]{2,}"
     r"|[A-Z][a-z][A-Za-z.'-]*\s*,\s*[A-Z][A-Za-z0-9& .'-]{1,80})"
     r"(?:\s*,\s*[A-Z][A-Za-z0-9& .'-]{1,80})?"
 )
 MARKDOWN_CROSSED_OUT_PRICE = re.compile(r"~~\s*\$?\d[\d,]*(?:\.\d+)?\s*~~")
 CSS_CROSSED_OUT_PRICE = re.compile(
-    r"(?:[.#][\w-]*(?:old|original|was)[\w-]*price[\w-]*|"
-    r"[.#][\w-]*price[\w-]*(?:old|original|was)[\w-]*)\s*\{[^}]{0,240}"
+    r"(?:[.#][\w-]*price[\w-]*)\s*\{[^}]{0,240}"
     r"\btext-decoration(?:-line)?\s*:\s*[^;}]*\bline-through\b"
     r"|style\s*=\s*['\"][^'\"]*\btext-decoration(?:-line)?\s*:\s*[^'\"]*\bline-through\b[^'\"]*['\"][^>]*>\s*\$?\d",
     re.I,
@@ -80,7 +79,7 @@ SECRET_PATTERNS = (
 )
 PLACEHOLDER_PATTERN = re.compile(r"\bYOUR_[A-Z0-9_]+\b")
 SENSITIVE_NAME_PATTERN = re.compile(r"(?:^|[._-])(?:auth|session|state)(?:$|[._-])", re.I)
-THIRD_PARTY_DIRECTORY_NAMES = {"third_party", "third-party", "thirdparty", "vendor"}
+THIRD_PARTY_DIRECTORY_NAMES = {"third_party", "third-party", "thirdparty", "vendor", "vendors"}
 COMPATIBLE_LICENSES = {"MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "CC0-1.0"}
 NOTICE_FILE_NAME = "THIRD_PARTY_NOTICES.md"
 NOTICE_SECTION_PATTERN = re.compile(r"^##\s+(.+?)\s*$", re.M)
@@ -122,6 +121,31 @@ def _is_sensitive_path(path: Path) -> bool:
 
 def _is_binary(content: bytes) -> bool:
     return b"\0" in content
+
+
+def _audit_file(file_path: Path, display_path: str) -> list[AuditFinding]:
+    if file_path.is_symlink():
+        return [AuditFinding("symlink", display_path)]
+
+    findings: list[AuditFinding] = []
+    if _is_sensitive_path(file_path):
+        findings.append(AuditFinding("sensitive_file", display_path))
+    try:
+        content = file_path.read_bytes()
+    except OSError:
+        findings.append(AuditFinding("unreadable_file", display_path))
+        return findings
+    if _is_binary(content):
+        try:
+            executable = bool(file_path.stat().st_mode & 0o111)
+        except OSError:
+            findings.append(AuditFinding("unreadable_file", display_path))
+            return findings
+        if executable:
+            findings.append(AuditFinding("executable_binary", display_path))
+        return findings
+    findings.extend(audit_text(content.decode("utf-8", errors="replace"), display_path))
+    return findings
 
 
 def _third_party_components(source_root: Path) -> set[str]:
@@ -203,17 +227,7 @@ def audit_tree(root: str | Path) -> list[AuditFinding]:
         for filename in sorted(filenames):
             file_path = current_path / filename
             relative_path = file_path.relative_to(source_root).as_posix()
-            if file_path.is_symlink():
-                findings.append(AuditFinding("symlink", relative_path))
-                continue
-            if _is_sensitive_path(file_path):
-                findings.append(AuditFinding("sensitive_file", relative_path))
-            content = file_path.read_bytes()
-            if _is_binary(content):
-                if file_path.stat().st_mode & 0o111:
-                    findings.append(AuditFinding("executable_binary", relative_path))
-                continue
-            findings.extend(audit_text(content.decode("utf-8", errors="replace"), relative_path))
+            findings.extend(_audit_file(file_path, relative_path))
 
     findings.extend(_audit_third_party_notices(source_root))
     return sorted(findings, key=lambda finding: (finding.path, finding.code, finding.detail))
@@ -230,11 +244,7 @@ def _cli_findings_for_path(path_text: str) -> list[AuditFinding]:
             for finding in audit_tree(path)
         ]
     if path.is_file():
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return [AuditFinding("unreadable_input", display_path)]
-        return audit_text(text, display_path)
+        return _audit_file(path, display_path)
     return [AuditFinding("invalid_input", display_path)]
 
 

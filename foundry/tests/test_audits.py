@@ -74,6 +74,18 @@ class AuditTextTests(unittest.TestCase):
         findings = audit_text('“This is excellent.” — Jane Doe, Acme Corp', "sales.html")
         self.assertIn("unsupported_testimonial", {finding.code for finding in findings})
 
+    def test_rejects_common_copy_pattern_bypasses(self):
+        cases = {
+            "best-selling": "unsupported_bestseller",
+            "Join 1,000 developers": "unsupported_social_proof",
+            "Today only": "unsupported_urgency_scarcity",
+            "“Excellent.” — Jane": "unsupported_testimonial",
+            ".price { text-decoration: line-through; }": "unsupported_discount_claim",
+        }
+        for text, code in cases.items():
+            with self.subTest(text=text):
+                self.assertIn(code, {finding.code for finding in audit_text(text, "sales.html")})
+
     def test_does_not_mistake_shell_comparison_for_attributed_testimonial(self):
         findings = audit_text('[ "$APPLY" -eq 0 ]', "scripts/install.sh")
         self.assertNotIn("unsupported_testimonial", {finding.code for finding in findings})
@@ -196,6 +208,21 @@ class AuditTreeTests(unittest.TestCase):
         )
         self.assertIn("incompatible_third_party_license", {finding.code for finding in audit_tree(self.root)})
 
+    def test_requires_notices_for_nested_vendors_directory(self):
+        self.write("src/vendors/gpl_lib/module.py", "print('gpl')")
+        self.assertIn("missing_third_party_notices", {finding.code for finding in audit_tree(self.root)})
+
+    def test_recognizes_nested_vendors_component_identity_for_gpl_rejection(self):
+        self.write("src/vendors/gpl_lib/module.py", "print('gpl')")
+        self.write(
+            "THIRD_PARTY_NOTICES.md",
+            "## src/vendors/gpl_lib\n- Source URL: https://example.com/gpl\n- License: GPL-3.0\n",
+        )
+        self.assertEqual(
+            {finding.code for finding in audit_tree(self.root)},
+            {"incompatible_third_party_license"},
+        )
+
     def test_validates_present_root_notice_without_detected_components(self):
         self.write(
             "THIRD_PARTY_NOTICES.md",
@@ -271,6 +298,43 @@ class AuditCliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("<stdin>: unsupported_testimonial\n", result.stdout)
         self.assertTrue(result.stdout.endswith("1 findings\n"))
+
+    def test_cli_individual_files_reject_sensitive_names(self):
+        for name in (".env", "auth.json", "session-data.txt", "state.yml"):
+            with self.subTest(name=name):
+                path = self.root / name
+                path.write_text("SAFE=value\n", encoding="utf-8")
+                result = self.run_cli(path)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{path.as_posix()}: sensitive_file\n", result.stdout)
+
+    def test_cli_individual_file_rejects_symlink(self):
+        target = self.root / "target.txt"
+        link = self.root / "link.txt"
+        target.write_text("plain text\n", encoding="utf-8")
+        link.symlink_to(target)
+        result = self.run_cli(link)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"{link.as_posix()}: symlink\n", result.stdout)
+
+    def test_cli_individual_file_rejects_executable_binary(self):
+        binary = self.root / "tool"
+        binary.write_bytes(b"\x7fELF\x00binary")
+        binary.chmod(0o755)
+        result = self.run_cli(binary)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"{binary.as_posix()}: executable_binary\n", result.stdout)
+
+    def test_cli_individual_file_reports_unreadable_input(self):
+        unreadable = self.root / "unreadable.txt"
+        unreadable.write_text("plain text\n", encoding="utf-8")
+        unreadable.chmod(0)
+        try:
+            result = self.run_cli(unreadable)
+        finally:
+            unreadable.chmod(0o600)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"{unreadable.as_posix()}: unreadable_file\n", result.stdout)
 
 
 if __name__ == "__main__":
