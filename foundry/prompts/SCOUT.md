@@ -26,10 +26,11 @@ through:
 (cd .. && python3 -m foundry.src.orchestrator stage-candidate --candidate foundry/state/scout-candidate.json --consume)
 ```
 
-Run this state-changing handoff only on the Mac/POSIX authority host. Windows
-is a product-compatibility target and deliberately fails closed before any
-Foundry state claim, receipt, or staging write; stop there and request a Mac
-authority-host handoff instead of retrying it on Windows.
+Run this state-changing handoff only on the Darwin/macOS authority host.
+Windows, WSL, and other Linux hosts are product-compatibility targets and
+deliberately fail closed before any Foundry state claim, receipt, or staging
+write; stop there and request a macOS authority-host handoff instead of
+retrying it on a compatibility host.
 
 The command atomically claims that exact proposal path and keeps a durable,
 bounded ignored receipt named `.scout-receipt-<sha256>-<uuid>.json` directly

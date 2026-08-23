@@ -21,13 +21,14 @@ This directory is the working directory for Hermes Product Foundry jobs.
   claims. Do not put third-party code or skills in paid archives unless the
   license is compatible and `THIRD_PARTY_NOTICES.md` names it.
 - Daily no-op runs are successful and silent. Keep heavy local model work
-  serialized on the Mac. The Mac control plane locks retained POSIX no-follow
-  directories, and its Scout claim/read/receipt/stage transaction uses those
-  descriptors for every pathname-sensitive action. `home-windows` is a pure
-  product-compatibility target and fails closed before any Foundry state
-  mutation. This covers cooperating Foundry processes and pathname replacement,
-  not arbitrary same-account writes made through an already-authorized
-  descriptor.
+  serialized on the Mac. Only the Darwin/macOS control plane may mutate
+  Foundry state or package a release. It binds every locked state-file read,
+  write, and unlink to a retained no-follow directory descriptor and rejects a
+  changed state pathname when the transaction exits. `home-windows`, WSL, and
+  other Linux hosts are pure product-compatibility targets and fail closed
+  before Foundry state mutation or packaging. This covers cooperating Foundry
+  processes and pathname replacement, not arbitrary same-account writes made
+  through an already-authorized descriptor.
 - Payout onboarding and final publication require the account owner's identity
   and action-time confirmation; neither is automated.
 - For a Windows compatibility claim, use only sanitized ignored

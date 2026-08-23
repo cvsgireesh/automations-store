@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import stat
 import struct
@@ -151,11 +153,11 @@ def _posix_state_directory_flags() -> int:
     return os.O_RDONLY | directory_flag | nofollow_flag
 
 
-def _require_posix_state_authority_host() -> None:
-    """Reject mutable control-plane work without no-follow directory FDs."""
-    if os.name == "nt" or fcntl is None:
+def _require_darwin_state_authority_host() -> None:
+    """Restrict mutable authority state to the verified Darwin/macOS host."""
+    if platform.system() != "Darwin" or os.name != "posix" or fcntl is None:
         raise FoundryError(
-            "Windows Foundry state mutation is unsupported; run the control plane on a POSIX no-follow directory-FD host"
+            "Foundry authority requires the Darwin/macOS control host; Windows, Linux, and WSL are compatibility-only"
         )
     _posix_state_directory_flags()
 
@@ -234,6 +236,12 @@ class _HeldStateLock:
     foundry_descriptor: int
 
 
+_ACTIVE_STATE_LOCK: ContextVar[_HeldStateLock | None] = ContextVar(
+    "foundry_active_state_lock",
+    default=None,
+)
+
+
 def _acquire_state_lock(descriptor: int) -> None:
     """Take an exclusive lock on a retained POSIX directory descriptor."""
     if fcntl is None:  # pragma: no cover - native Windows fails before here
@@ -251,27 +259,24 @@ def _release_state_lock(descriptor: int) -> None:
 
 @contextmanager
 def state_lock(repo_root: str | Path) -> Iterator[_HeldStateLock]:
-    """Serialize mutable Foundry state with retained POSIX directory FDs.
+    """Serialize macOS authority state with retained directory descriptors.
 
-    The authority control plane is deliberately unavailable on Windows.  The
-    Python standard library cannot perform the descriptor-relative state-file
-    operations needed to survive a state-directory junction/rename race there.
-    A Windows compatibility host may run pure product checks, but must not
+    The authority control plane is deliberately unavailable on Windows, Linux,
+    and WSL. Compatibility hosts may run pure product checks, but must not
     collect, gate, stage, consume, or package Foundry state.
 
-    Scout claim/read/receipt/stage operations use these descriptors for every
-    pathname-sensitive action. The lock protects cooperating Foundry processes
-    from replacement; it does not defend against arbitrary same-account writes
-    through an already-authorized descriptor. Receipt hard links retain those
-    bytes for operator recovery.
+    Every direct state-file read, write, and unlink in the transaction uses the
+    retained state descriptor. The lexical state name is checked again when the
+    context exits, so a pathname replacement is never silently accepted.
     """
-    _require_posix_state_authority_host()
+    _require_darwin_state_authority_host()
     root = _repo_root(repo_root)
     foundry = _foundry_root(root)
     foundry_fd, foundry_details = _open_verified_posix_directory(foundry, "checked-in foundry directory")
     state_fd: int | None = None
     foundry_acquired = False
     state_acquired = False
+    context_token = None
     try:
         # This stable parent lock prevents a replacement state directory from
         # becoming a second lock domain. The validated state FD is also
@@ -281,9 +286,16 @@ def state_lock(repo_root: str | Path) -> Iterator[_HeldStateLock]:
         state_root, state_fd, state_identity = _open_posix_state_directory(root, foundry_fd, foundry_details)
         _acquire_state_lock(state_fd)
         state_acquired = True
-        yield _HeldStateLock(state_root, state_fd, state_identity, foundry_fd)
+        held = _HeldStateLock(state_root, state_fd, state_identity, foundry_fd)
+        context_token = _ACTIVE_STATE_LOCK.set(held)
+        try:
+            yield held
+        finally:
+            _assert_held_state_path(held)
     finally:
         try:
+            if context_token is not None:
+                _ACTIVE_STATE_LOCK.reset(context_token)
             if state_fd is not None:
                 try:
                     if state_acquired:
@@ -298,6 +310,21 @@ def state_lock(repo_root: str | Path) -> Iterator[_HeldStateLock]:
                 os.close(foundry_fd)
 
 
+def _active_state_file(path: str | Path) -> tuple[_HeldStateLock, str] | None:
+    """Resolve a direct state filename lexically against the active state FD."""
+    held = _ACTIVE_STATE_LOCK.get()
+    if held is None:
+        return None
+    target = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+    try:
+        relative = target.relative_to(held.state_root)
+    except ValueError:
+        return None
+    if len(relative.parts) != 1 or relative.name in {"", ".", ".."}:
+        raise FoundryError("Foundry state transactions support only direct state files")
+    return held, relative.name
+
+
 def _canonical_json(payload: Any) -> bytes:
     return (json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
@@ -305,6 +332,11 @@ def _canonical_json(payload: Any) -> bytes:
 def atomic_write_json(destination: str | Path, payload: Any) -> None:
     """Persist canonical JSON with a sibling temporary file and ``os.replace``."""
     target = Path(destination)
+    active = _active_state_file(target)
+    if active is not None:
+        held, name = active
+        _atomic_write_bytes_at(held.descriptor, name, _canonical_json(payload))
+        return
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
     try:
@@ -328,6 +360,11 @@ def atomic_write_json(destination: str | Path, payload: Any) -> None:
 def atomic_write_bytes(destination: str | Path, content: bytes) -> None:
     """Persist bytes with a sibling temporary file and one atomic replace."""
     target = Path(destination)
+    active = _active_state_file(target)
+    if active is not None:
+        held, name = active
+        _atomic_write_bytes_at(held.descriptor, name, content)
+        return
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
     try:
@@ -349,12 +386,49 @@ def atomic_write_bytes(destination: str | Path, content: bytes) -> None:
 
 
 def _read_json(path: Path, *, default: Any = None) -> Any:
+    active = _active_state_file(path)
+    if active is not None:
+        held, name = active
+        return _read_state_json_at(held.descriptor, name, default=default)
     if not path.exists():
         return default
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise FoundryError(f"invalid Foundry state file: {path}") from error
+
+
+def _read_bytes(path: Path, *, default: bytes | None = None) -> bytes | None:
+    """Read bytes through the retained state FD when a transaction is active."""
+    active = _active_state_file(path)
+    if active is not None:
+        held, name = active
+        return _read_state_bytes_at(held.descriptor, name, default=default)
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return default
+    except OSError as error:
+        raise FoundryError(f"invalid Foundry state file: {path}") from error
+
+
+def _file_exists(path: Path) -> bool:
+    """Check a state entry through the retained directory when locked."""
+    active = _active_state_file(path)
+    if active is not None:
+        held, name = active
+        return _state_file_exists_at(held.descriptor, name)
+    return path.exists()
+
+
+def _unlink_file(path: Path, *, missing_ok: bool = False) -> None:
+    """Unlink a state entry through the retained directory when locked."""
+    active = _active_state_file(path)
+    if active is not None:
+        held, name = active
+        _unlink_state_file_at(held.descriptor, name, missing_ok=missing_ok)
+        return
+    path.unlink(missing_ok=missing_ok)
 
 
 def _signal_mapping(signal: Signal) -> dict[str, Any]:
@@ -418,9 +492,8 @@ def _latest_signals_unlocked(repo_root: Path) -> list[Signal]:
 
 def _signal_state_sha256_unlocked(repo_root: Path) -> str | None:
     """Hash exact persisted last-good bytes without parsing source evidence."""
-    try:
-        content = (_state_root(repo_root) / SIGNALS_FILE).read_bytes()
-    except OSError:
+    content = _read_bytes(_state_root(repo_root) / SIGNALS_FILE, default=None)
+    if content is None:
         return None
     return hashlib.sha256(content).hexdigest()
 
@@ -516,9 +589,9 @@ def collect_signals(repo_root: str | Path, observed_date: str | None = None, *,
                     config: Mapping[str, Any] | str | Path | None = None,
                     fixture_dir: str | Path | None = None) -> dict[str, Any]:
     """Boundedly collect signals while preserving the previous good record on error."""
-    # Do this before a network/file fetch: a Windows compatibility host must
-    # not do work it cannot commit through the authority state transaction.
-    _require_posix_state_authority_host()
+    # Do this before a network/file fetch: a compatibility host must not do
+    # work it cannot commit through the macOS authority state transaction.
+    _require_darwin_state_authority_host()
     root = _repo_root(repo_root)
     observation_date = _validated_date(observed_date)
     source_config = config if config is not None else _foundry_root(root) / "config.json"
@@ -526,7 +599,7 @@ def collect_signals(repo_root: str | Path, observed_date: str | None = None, *,
         collected = collect(source_config, _observed_at(observation_date), fixture_dir)
     except Exception as error:
         with state_lock(root):
-            preserved = (_state_root(root) / SIGNALS_FILE).exists()
+            preserved = _file_exists(_state_root(root) / SIGNALS_FILE)
             # Do not persist an exception string: it can contain remote or
             # local details.  The date/status are sufficient to fail the gate
             # closed while preserving the last good normalized evidence.
@@ -725,16 +798,25 @@ def _claim_scout_proposal(proposal: Path, held: _HeldStateLock) -> Path:
             src_dir_fd=held.descriptor,
             dst_dir_fd=held.descriptor,
         )
-        after = os.stat(claimed_name, dir_fd=held.descriptor, follow_symlinks=False)
     except OSError as error:
         raise CandidateError("Scout proposal could not be claimed atomically") from error
-    if (
-        _is_link_or_reparse(Path(claimed_name), after)
-        or not stat.S_ISREG(after.st_mode)
-        or not _same_file_identity(before, after)
-    ):
-        raise CandidateError("Scout proposal changed while it was being claimed")
-    _assert_held_state_path(held)
+    try:
+        after = os.stat(claimed_name, dir_fd=held.descriptor, follow_symlinks=False)
+        if (
+            _is_link_or_reparse(Path(claimed_name), after)
+            or not stat.S_ISREG(after.st_mode)
+            or not _same_file_identity(before, after)
+        ):
+            raise CandidateError("Scout proposal changed while it was being claimed")
+        _assert_held_state_path(held)
+    except Exception as error:
+        try:
+            _restore_scout_claim(held, proposal.name, claimed_name)
+        except Exception as restore_error:
+            raise CandidateError("Scout proposal claim failed and could not be restored safely") from restore_error
+        if isinstance(error, CandidateError):
+            raise
+        raise CandidateError("Scout proposal could not be claimed atomically") from error
     return held.state_root / claimed_name
 
 
@@ -813,17 +895,24 @@ def _assert_held_state_path(held: _HeldStateLock) -> None:
     try:
         current = os.stat(STATE_NAME, dir_fd=held.foundry_descriptor, follow_symlinks=False)
     except OSError as error:
-        raise CandidateError("Foundry state directory disappeared during Scout handling") from error
+        raise CandidateError("Foundry state directory disappeared during state transaction") from error
     if (
         _is_link_or_reparse(held.state_root, current)
         or not stat.S_ISDIR(current.st_mode)
         or _file_identity(current) != held.state_identity
     ):
-        raise CandidateError("Foundry state directory changed during Scout handling")
+        raise CandidateError("Foundry state directory changed during state transaction")
 
 
-def _read_state_json_at(directory_fd: int, name: str, *, default: Any = None) -> Any:
-    """Read one state JSON file through its retained POSIX directory FD."""
+def _require_direct_state_name(name: str) -> None:
+    if not name or Path(name).name != name or name in {".", ".."}:
+        raise CandidateError("Foundry state filename must be one direct safe name")
+
+
+def _read_state_bytes_at(directory_fd: int, name: str, *,
+                         default: bytes | None = None) -> bytes | None:
+    """Read one state file through its retained directory descriptor."""
+    _require_direct_state_name(name)
     try:
         before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -861,14 +950,68 @@ def _read_state_json_at(directory_fd: int, name: str, *, default: Any = None) ->
         and after_open.st_size == len(raw)
     ):
         raise CandidateError("Foundry state file changed while it was being read")
+    return raw
+
+
+def _read_state_json_at(directory_fd: int, name: str, *, default: Any = None) -> Any:
+    """Read one state JSON file through its retained directory descriptor."""
+    raw = _read_state_bytes_at(directory_fd, name, default=None)
+    if raw is None:
+        return default
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise CandidateError("Foundry state file is invalid JSON") from error
 
 
-def _atomic_write_json_at(directory_fd: int, name: str, payload: Any) -> None:
-    """Atomically replace one state JSON name through its retained directory FD."""
+def _state_file_exists_at(directory_fd: int, name: str) -> bool:
+    """Check one direct regular state file without following a link."""
+    _require_direct_state_name(name)
+    try:
+        details = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise CandidateError("Foundry state file could not be inspected") from error
+    if _is_link_or_reparse(Path(name), details) or not stat.S_ISREG(details.st_mode):
+        raise CandidateError("Foundry state file must be a regular non-link file")
+    return True
+
+
+def _unlink_state_file_at(directory_fd: int, name: str, *, missing_ok: bool = False) -> None:
+    """Unlink one regular state file through its retained directory descriptor."""
+    _require_direct_state_name(name)
+    try:
+        details = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if missing_ok:
+            return
+        raise
+    except OSError as error:
+        raise CandidateError("Foundry state file could not be inspected before unlink") from error
+    if _is_link_or_reparse(Path(name), details) or not stat.S_ISREG(details.st_mode):
+        raise CandidateError("Foundry state unlink requires a regular non-link file")
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        if not missing_ok:
+            raise
+    except OSError as error:
+        raise CandidateError("Foundry state file could not be unlinked") from error
+
+
+def _atomic_write_bytes_at(directory_fd: int, name: str, content: bytes) -> None:
+    """Atomically replace one state name through its retained directory FD."""
+    _require_direct_state_name(name)
+    try:
+        existing = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise CandidateError("Foundry state destination could not be inspected") from error
+    else:
+        if _is_link_or_reparse(Path(name), existing) or not stat.S_ISREG(existing.st_mode):
+            raise CandidateError("Foundry state destination must be a regular non-link file")
     temporary = f".{name}.{uuid.uuid4().hex}.tmp"
     descriptor: int | None = None
     replaced = False
@@ -884,7 +1027,7 @@ def _atomic_write_json_at(directory_fd: int, name: str, payload: Any) -> None:
             raise CandidateError("Foundry state temporary file could not be created") from error
         with os.fdopen(descriptor, "wb") as target:
             descriptor = None
-            target.write(_canonical_json(payload))
+            target.write(content)
             target.flush()
             os.fsync(target.fileno())
         try:
@@ -902,6 +1045,11 @@ def _atomic_write_json_at(directory_fd: int, name: str, payload: Any) -> None:
                 pass
             except OSError:
                 pass
+
+
+def _atomic_write_json_at(directory_fd: int, name: str, payload: Any) -> None:
+    """Atomically replace one state JSON name through its retained directory FD."""
+    _atomic_write_bytes_at(directory_fd, name, _canonical_json(payload))
 
 
 def _has_successful_candidate_in_held_state(repo_root: Path, held: _HeldStateLock,
@@ -1237,10 +1385,7 @@ def _stale_signal_ids(candidate: Mapping[str, Any], signals: Sequence[Signal], a
 
 
 def _remove_stale_gate_unlocked(repo_root: Path) -> None:
-    try:
-        (_state_root(repo_root) / GATE_FILE).unlink()
-    except FileNotFoundError:
-        pass
+    _unlink_file(_state_root(repo_root) / GATE_FILE, missing_ok=True)
 
 
 def gate_candidate(repo_root: str | Path, payload: Mapping[str, Any], *,
@@ -1297,7 +1442,7 @@ def gate_current_candidate(repo_root: str | Path) -> dict[str, Any] | None:
         candidate = dict(staged["candidate"])
         digest = staged.get("candidate_sha256")
         if isinstance(digest, str) and _has_successful_candidate_unlocked(root, digest):
-            _candidate_path(root).unlink(missing_ok=True)
+            _unlink_file(_candidate_path(root), missing_ok=True)
             _remove_stale_gate_unlocked(root)
             return None
     return gate_candidate(root, candidate)
@@ -1445,14 +1590,13 @@ def _private_product_source(repo_root: Path, slug: str) -> Path:
 def _supports_secure_snapshot_host() -> bool:
     """Whether this host can enforce the FD-relative no-follow snapshot contract.
 
-    Authority packaging needs directory descriptors plus no-follow opens for
-    every source component.  Native Windows remains a supported compatibility
-    and monitoring target, but its Python file APIs do not offer that same
-    verified directory-FD contract.  Refuse packaging there instead of
-    silently falling back to path-based traversal.
+    Authority packaging is intentionally pinned to Darwin/macOS, where the
+    product suite is actually run and named. Windows, Linux, and WSL remain
+    compatibility targets and cannot produce a Mac test claim.
     """
     return (
-        os.name == "posix"
+        platform.system() == "Darwin"
+        and os.name == "posix"
         and bool(getattr(os, "O_DIRECTORY", 0))
         and bool(getattr(os, "O_NOFOLLOW", 0))
     )
@@ -1579,6 +1723,7 @@ def _build_control_revision(repo_root: Path) -> str | None:
 
 def _tested_platform_scope_unlocked(repo_root: Path, source_revision: str) -> tuple[list[str], str]:
     """Include Windows only when its sanitized evidence matches paid source."""
+    _require_darwin_state_authority_host()
     platforms = [MAC_PRODUCT_SUITE]
     payload = _read_json(_state_root(repo_root) / PLATFORM_VERIFICATION_FILE, default=None)
     windows_evidence = payload.get("windows_native_compatibility") if isinstance(payload, Mapping) else None
@@ -1598,6 +1743,7 @@ def _tested_platform_scope_unlocked(repo_root: Path, source_revision: str) -> tu
 
 
 def _run_product_tests(repo_root: Path, slug: str) -> tuple[str, str]:
+    _require_darwin_state_authority_host()
     command = f"python3 -B private-products/{slug}/tests/test_kit.py -v"
     test_path = repo_root / "private-products" / slug / "tests" / "test_kit.py"
     if not test_path.is_file():
@@ -1680,7 +1826,7 @@ def _retire_staged_candidate_unlocked(repo_root: Path, candidate_digest: str) ->
     """Remove a fulfilled handoff so the weekly Builder monitor stays quiet."""
     staged = _read_json(_candidate_path(repo_root))
     if isinstance(staged, Mapping) and staged.get("candidate_sha256") == candidate_digest:
-        _candidate_path(repo_root).unlink(missing_ok=True)
+        _unlink_file(_candidate_path(repo_root), missing_ok=True)
     _remove_stale_gate_unlocked(repo_root)
 
 

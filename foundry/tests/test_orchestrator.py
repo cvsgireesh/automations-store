@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import sys
@@ -39,12 +40,11 @@ from foundry.src.orchestrator import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = REPO_ROOT / "foundry" / "tests" / "fixtures"
 OBSERVED_AT = "2026-08-23T00:00:00-05:00"
-# Windows is a compatibility target.  Authority packaging requires the
-# FD-relative O_DIRECTORY/O_NOFOLLOW snapshot contract and is tested on the
-# POSIX builder host; native Windows instead runs the explicit fail-closed
-# coverage below.
-POSIX_SNAPSHOT_REQUIRED = unittest.skipIf(
-    os.name == "nt", "authority packaging requires the POSIX no-follow snapshot host"
+# Windows and Linux are compatibility targets. Authority packaging is limited
+# to the Darwin/macOS builder host; native Windows instead runs the explicit
+# fail-closed coverage below.
+MACOS_AUTHORITY_REQUIRED = unittest.skipUnless(
+    sys.platform == "darwin", "authority packaging requires the Darwin/macOS no-follow snapshot host"
 )
 
 
@@ -81,7 +81,7 @@ def new_candidate(slug: str = "operator-kit") -> dict:
     }
 
 
-@unittest.skipIf(os.name == "nt", "mutable Foundry authority state requires the POSIX descriptor-bound host")
+@unittest.skipUnless(sys.platform == "darwin", "mutable Foundry authority state requires Darwin/macOS")
 class OrchestratorTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -185,8 +185,8 @@ class OrchestratorTests(unittest.TestCase):
 
         The standard library cannot make Windows claim/stage writes immune to
         an ancestor-entry rename, so the control plane rejects them before
-        state access. The authority host is the POSIX descriptor-bound builder,
-        rather than a best-effort Windows pathname transaction.
+        state access. The authority host is the Darwin/macOS descriptor-bound
+        builder, rather than a best-effort Windows pathname transaction.
         """
         from foundry.src import orchestrator
 
@@ -195,9 +195,9 @@ class OrchestratorTests(unittest.TestCase):
         proposal.write_text(json.dumps(new_candidate("windows-authority-kit")), encoding="utf-8")
         original_proposal = proposal.read_bytes()
         with mock.patch.object(orchestrator, "fcntl", None):
-            with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+            with self.assertRaisesRegex(orchestrator.FoundryError, "Darwin/macOS"):
                 stage_candidate(self.root, new_candidate("windows-authority-kit"))
-            with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+            with self.assertRaisesRegex(orchestrator.FoundryError, "Darwin/macOS"):
                 stage_candidate_file(self.root, proposal, consume=True)
         self.assertFalse((state / "candidate.json").exists())
         self.assertEqual(proposal.read_bytes(), original_proposal)
@@ -248,8 +248,8 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(second_entered.is_set())
 
     @unittest.skipIf(os.name == "nt", "POSIX directory descriptors are required")
-    def test_posix_state_lock_survives_state_directory_replacement(self):
-        """A replacement state directory cannot create a second lock domain."""
+    def test_posix_state_lock_serializes_and_reports_state_directory_replacement(self):
+        """A replacement cannot split the lock domain or pass exit validation."""
         from foundry.src import orchestrator
 
         state = self.root / "foundry" / "state"
@@ -286,7 +286,9 @@ class OrchestratorTests(unittest.TestCase):
             if original_state.exists():
                 os.replace(original_state, state)
         self.assertFalse(first.is_alive() or second.is_alive())
-        self.assertEqual(errors, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], CandidateError)
+        self.assertIn("state directory changed", str(errors[0]))
         self.assertTrue(second_entered.is_set())
 
     @unittest.skipIf(os.name == "nt", "POSIX directory descriptors are required")
@@ -299,6 +301,108 @@ class OrchestratorTests(unittest.TestCase):
         with orchestrator.state_lock(self.root):
             pass
         self.assertEqual(outside.read_bytes(), b"")
+
+    def test_gate_state_swap_cannot_redirect_reads_or_gate_output(self):
+        """Every gate state access remains bound to the retained state FD."""
+        from foundry.src import orchestrator
+
+        self.write_signals(accepted_signals())
+        state = self.root / "foundry" / "state"
+        original_state = self.root / "foundry" / "state-original"
+        replacement = self.root / "foundry" / "state-replacement"
+        shutil.copytree(state, replacement)
+        original_read_json = orchestrator._read_json
+        swapped = False
+
+        def read_after_swap(path, *args, **kwargs):
+            nonlocal swapped
+            if not swapped and Path(path).name == "latest-signals.json":
+                os.replace(state, original_state)
+                os.replace(replacement, state)
+                swapped = True
+            return original_read_json(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(orchestrator, "_read_json", side_effect=read_after_swap):
+                with self.assertRaisesRegex(orchestrator.FoundryError, "state directory changed"):
+                    gate_candidate(self.root, new_candidate())
+            self.assertTrue(swapped)
+            self.assertTrue((original_state / "gate.json").is_file())
+            self.assertFalse((state / "gate.json").exists())
+        finally:
+            if state.exists():
+                shutil.rmtree(state)
+            if original_state.exists():
+                os.replace(original_state, state)
+            if replacement.exists():
+                shutil.rmtree(replacement)
+
+    def test_collection_state_swap_cannot_redirect_signal_or_health_writes(self):
+        """Collector output and its health marker use the retained state FD."""
+        from foundry.src import orchestrator
+
+        state = self.root / "foundry" / "state"
+        original_state = self.root / "foundry" / "state-original"
+        original_replace = os.replace
+        swapped = False
+        config = json.loads((REPO_ROOT / "foundry" / "config.json").read_text(encoding="utf-8"))
+
+        def replace_after_swap(source, destination, *args, **kwargs):
+            nonlocal swapped
+            if not swapped and Path(destination).name == "latest-signals.json":
+                original_replace(state, original_state)
+                state.mkdir()
+                if os.path.isabs(os.fspath(source)):
+                    shutil.copy2(original_state / Path(source).name, state / Path(source).name)
+                swapped = True
+            return original_replace(source, destination, *args, **kwargs)
+
+        try:
+            with mock.patch.object(orchestrator.os, "replace", side_effect=replace_after_swap):
+                with self.assertRaisesRegex(orchestrator.FoundryError, "state directory changed"):
+                    collect_signals(self.root, "2026-08-23", config=config, fixture_dir=FIXTURES)
+            self.assertTrue(swapped)
+            self.assertTrue((original_state / "latest-signals.json").is_file())
+            self.assertTrue((original_state / "collection-status.json").is_file())
+            self.assertFalse((state / "latest-signals.json").exists())
+            self.assertFalse((state / "collection-status.json").exists())
+        finally:
+            if state.exists():
+                shutil.rmtree(state)
+            if original_state.exists():
+                os.replace(original_state, state)
+
+    def test_ledger_state_swap_cannot_redirect_success_write(self):
+        """Release-ledger writes stay in the originally locked state directory."""
+        from foundry.src import orchestrator
+
+        state = self.root / "foundry" / "state"
+        original_state = self.root / "foundry" / "state-original"
+        original_replace = os.replace
+        swapped = False
+
+        def replace_after_swap(source, destination, *args, **kwargs):
+            nonlocal swapped
+            if not swapped and Path(destination).name == "release-ledger.json":
+                original_replace(state, original_state)
+                state.mkdir()
+                if os.path.isabs(os.fspath(source)):
+                    shutil.copy2(original_state / Path(source).name, state / Path(source).name)
+                swapped = True
+            return original_replace(source, destination, *args, **kwargs)
+
+        try:
+            with mock.patch.object(orchestrator.os, "replace", side_effect=replace_after_swap):
+                with self.assertRaisesRegex(orchestrator.FoundryError, "state directory changed"):
+                    mark_successful_release(self.root, "candidate-digest", "operator-kit", "1.0.0")
+            self.assertTrue(swapped)
+            self.assertTrue((original_state / "release-ledger.json").is_file())
+            self.assertFalse((state / "release-ledger.json").exists())
+        finally:
+            if state.exists():
+                shutil.rmtree(state)
+            if original_state.exists():
+                os.replace(original_state, state)
 
     def test_collection_uses_fixtures_and_preserves_last_good_signals_on_failure(self):
         config = json.loads((REPO_ROOT / "foundry" / "config.json").read_text(encoding="utf-8"))
@@ -455,6 +559,31 @@ class OrchestratorTests(unittest.TestCase):
         with self.assertRaises(CandidateError):
             stage_candidate_file(self.root, other, consume=True)
         self.assertTrue(other.exists())
+
+    def test_claim_restores_proposal_when_post_rename_stat_fails(self):
+        """A failure inside claim validation cannot strand the approved handoff."""
+        from foundry.src import orchestrator
+
+        proposal = self.root / "foundry" / "state" / "scout-candidate.json"
+        original = json.dumps(new_candidate("claim-recovery-kit")).encode("utf-8")
+        proposal.write_bytes(original)
+        original_stat = os.stat
+        injected = False
+
+        def fail_claim_stat(path, *args, **kwargs):
+            nonlocal injected
+            if not injected and str(path).startswith(".scout-candidate.json.claim-"):
+                injected = True
+                raise OSError("injected post-rename stat failure")
+            return original_stat(path, *args, **kwargs)
+
+        with mock.patch.object(orchestrator.os, "stat", side_effect=fail_claim_stat):
+            with self.assertRaisesRegex(CandidateError, "claimed atomically"):
+                stage_candidate_file(self.root, proposal, consume=True)
+        self.assertTrue(injected)
+        self.assertTrue(proposal.exists())
+        self.assertEqual(proposal.read_bytes(), original)
+        self.assertEqual(list(proposal.parent.glob(".scout-candidate.json.claim-*")), [])
 
     def test_scout_proposal_symlink_is_never_followed_or_target_deleted(self):
         proposal = self.root / "foundry" / "state" / "scout-candidate.json"
@@ -694,7 +823,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(result["status"], "noop")
         self.assertFalse((self.root / "dist").exists())
 
-    @POSIX_SNAPSHOT_REQUIRED
+    @MACOS_AUTHORITY_REQUIRED
     def test_distinct_candidate_cannot_overwrite_an_existing_slug_version(self):
         slug = "hermes-hybrid-operator-kit"
         self.write_packagable_product(slug)
@@ -978,7 +1107,7 @@ class OrchestratorTests(unittest.TestCase):
             if original_state.exists():
                 os.replace(original_state, state)
 
-    @POSIX_SNAPSHOT_REQUIRED
+    @MACOS_AUTHORITY_REQUIRED
     def test_package_writes_verified_manifest_and_truthful_listing_without_publication(self):
         slug = "hermes-hybrid-operator-kit"
         source = self.root / "private-products" / slug
@@ -1084,7 +1213,7 @@ class OrchestratorTests(unittest.TestCase):
                     with self.assertRaisesRegex(ReleaseError, "link or reparse"):
                         source_tree_revision(source)
 
-    @POSIX_SNAPSHOT_REQUIRED
+    @MACOS_AUTHORITY_REQUIRED
     def test_private_source_reparse_point_is_rejected_before_a_test_can_run(self):
         slug = "hermes-hybrid-operator-kit"
         sentinel = self.root / "reparse-source-test-ran"
@@ -1109,7 +1238,7 @@ class OrchestratorTests(unittest.TestCase):
                 package_release(self.root, slug, "1.0.0")
         self.assertFalse(sentinel.exists())
 
-    @POSIX_SNAPSHOT_REQUIRED
+    @MACOS_AUTHORITY_REQUIRED
     def test_package_audits_a_snapshot_before_a_symlinked_test_can_execute(self):
         slug = "hermes-hybrid-operator-kit"
         source = self.write_packagable_product(slug)
@@ -1130,7 +1259,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
 
     def test_unsupported_snapshot_host_fails_closed_before_private_source_execution(self):
-        """Windows compatibility runs never become an authority packager."""
+        """Compatibility hosts never become an authority packager."""
         slug = "hermes-hybrid-operator-kit"
         sentinel = self.root / "unsupported-host-test-ran"
         self.write_packagable_product(
@@ -1150,7 +1279,82 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(sentinel.exists())
         self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
 
-    @POSIX_SNAPSHOT_REQUIRED
+    def test_linux_or_wsl_fails_before_authority_state_or_package_execution(self):
+        """A generic POSIX host cannot mutate state or claim a Mac test run."""
+        from foundry.src import orchestrator
+
+        slug = "linux-boundary-kit"
+        sentinel = self.root / "linux-product-test-ran"
+        self.write_packagable_product(
+            slug,
+            test_body=(
+                "from pathlib import Path\n"
+                f"Path({str(sentinel)!r}).write_text('ran', encoding='utf-8')\n"
+            ),
+        )
+        self.write_signals(accepted_signals())
+        gate_candidate(self.root, new_candidate(slug))
+        state_before = {
+            path.name: path.read_bytes()
+            for path in (self.root / "foundry" / "state").iterdir()
+            if path.is_file()
+        }
+        with mock.patch.object(platform, "system", return_value="Linux"):
+            with self.assertRaisesRegex(orchestrator.FoundryError, "Darwin/macOS"):
+                stage_candidate(self.root, new_candidate("linux-state-kit"))
+            with self.assertRaisesRegex(orchestrator.FoundryError, "Darwin/macOS"):
+                package_release(self.root, slug, "1.0.0")
+            self.assertFalse(orchestrator._supports_secure_snapshot_host())
+        state_after = {
+            path.name: path.read_bytes()
+            for path in (self.root / "foundry" / "state").iterdir()
+            if path.is_file()
+        }
+        self.assertEqual(state_after, state_before)
+        self.assertFalse(sentinel.exists())
+        self.assertFalse((self.root / "dist").exists())
+
+    @MACOS_AUTHORITY_REQUIRED
+    def test_package_state_swap_cannot_redirect_ledger_or_retirement(self):
+        """Package state writes and unlinks stay on the retained state FD."""
+        from foundry.src import orchestrator
+
+        slug = "package-state-kit"
+        self.write_packagable_product(slug)
+        self.write_signals(accepted_signals())
+        stage_candidate(self.root, new_candidate(slug))
+        self.assertTrue(gate_current_candidate(self.root)["passed"])
+        state = self.root / "foundry" / "state"
+        original_state = self.root / "foundry" / "state-original"
+        original_replace = os.replace
+        swapped = False
+
+        def replace_after_swap(source, destination, *args, **kwargs):
+            nonlocal swapped
+            if not swapped and Path(destination).name == "release-ledger.json":
+                original_replace(state, original_state)
+                state.mkdir()
+                if os.path.isabs(os.fspath(source)):
+                    shutil.copy2(original_state / Path(source).name, state / Path(source).name)
+                swapped = True
+            return original_replace(source, destination, *args, **kwargs)
+
+        try:
+            with mock.patch.object(orchestrator.os, "replace", side_effect=replace_after_swap):
+                with self.assertRaisesRegex(orchestrator.FoundryError, "state directory changed"):
+                    package_release(self.root, slug, "1.0.0")
+            self.assertTrue(swapped)
+            self.assertTrue((original_state / "release-ledger.json").is_file())
+            self.assertFalse((original_state / "current-candidate.json").exists())
+            self.assertFalse((original_state / "gate.json").exists())
+            self.assertFalse((state / "release-ledger.json").exists())
+        finally:
+            if state.exists():
+                shutil.rmtree(state)
+            if original_state.exists():
+                os.replace(original_state, state)
+
+    @MACOS_AUTHORITY_REQUIRED
     def test_package_rejects_linked_private_products_ancestry_before_execution(self):
         slug = "hermes-hybrid-operator-kit"
         source = self.write_packagable_product(slug)
@@ -1169,7 +1373,7 @@ class OrchestratorTests(unittest.TestCase):
             package_release(self.root, slug, "1.0.0")
         self.assertFalse(sentinel.exists())
 
-    @POSIX_SNAPSHOT_REQUIRED
+    @MACOS_AUTHORITY_REQUIRED
     def test_snapshot_mutation_during_product_tests_fails_before_any_release_output(self):
         slug = "hermes-hybrid-operator-kit"
         test_body = (
@@ -1183,7 +1387,7 @@ class OrchestratorTests(unittest.TestCase):
             package_release(self.root, slug, "1.0.0")
         self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
 
-    @POSIX_SNAPSHOT_REQUIRED
+    @MACOS_AUTHORITY_REQUIRED
     def test_release_rejects_a_build_race_instead_of_misbinding_source_revision_and_windows_claim(self):
         slug = "hermes-hybrid-operator-kit"
         source = self.write_packagable_product(slug)
@@ -1209,7 +1413,7 @@ class OrchestratorTests(unittest.TestCase):
                 package_release(self.root, slug, "1.0.0")
         self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
 
-    @POSIX_SNAPSHOT_REQUIRED
+    @MACOS_AUTHORITY_REQUIRED
     def test_generated_release_and_listing_copy_are_claim_audited_before_output(self):
         cases = (
             ("best-seller", {"name": "Best-selling operator kit"}, "unsupported_bestseller"),
@@ -1226,7 +1430,7 @@ class OrchestratorTests(unittest.TestCase):
                     package_release(self.root, slug, "1.0.0")
                 self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
 
-    @POSIX_SNAPSHOT_REQUIRED
+    @MACOS_AUTHORITY_REQUIRED
     def test_all_public_metadata_copy_fields_are_claim_audited_before_output(self):
         cases = (
             ("description-bestseller", {"description": "Best-selling operator kit."}, "unsupported_bestseller"),
@@ -1243,7 +1447,7 @@ class OrchestratorTests(unittest.TestCase):
                     package_release(self.root, slug, "1.0.0")
                 self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
 
-    @POSIX_SNAPSHOT_REQUIRED
+    @MACOS_AUTHORITY_REQUIRED
     def test_stale_windows_platform_evidence_is_excluded_from_release_scope(self):
         slug = "hermes-hybrid-operator-kit"
         source = self.root / "private-products" / slug
@@ -1334,7 +1538,7 @@ class WindowsStateBoundaryTests(unittest.TestCase):
         from foundry.src import orchestrator
 
         state = self.root / "foundry" / "state"
-        with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+        with self.assertRaisesRegex(orchestrator.FoundryError, "Darwin/macOS"):
             with orchestrator.state_lock(self.root):
                 pass
         self.assertFalse(state.exists())
@@ -1343,7 +1547,7 @@ class WindowsStateBoundaryTests(unittest.TestCase):
         from foundry.src import orchestrator
 
         with mock.patch.object(orchestrator, "collect") as fetched:
-            with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+            with self.assertRaisesRegex(orchestrator.FoundryError, "Darwin/macOS"):
                 collect_signals(self.root, "2026-08-23", config={})
         fetched.assert_not_called()
         self.assertFalse((self.root / "foundry" / "state").exists())
@@ -1356,7 +1560,7 @@ class WindowsStateBoundaryTests(unittest.TestCase):
         proposal = state / "scout-candidate.json"
         proposal.write_text(json.dumps(new_candidate("windows-boundary-kit")), encoding="utf-8")
         original = proposal.read_bytes()
-        with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+        with self.assertRaisesRegex(orchestrator.FoundryError, "Darwin/macOS"):
             stage_candidate_file(self.root, proposal, consume=True)
         self.assertEqual(proposal.read_bytes(), original)
         self.assertFalse((state / "current-candidate.json").exists())
@@ -1370,14 +1574,14 @@ class WindowsStateBoundaryTests(unittest.TestCase):
         outside = self.root / "outside"
         outside.mkdir()
         created = subprocess.run(
-            ["cmd.exe", "/d", "/c", f'mklink /J "{state}" "{outside}"'],
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(state), str(outside)],
             text=True,
             capture_output=True,
             check=False,
         )
         self.assertEqual(created.returncode, 0, created.stderr)
         try:
-            with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+            with self.assertRaisesRegex(orchestrator.FoundryError, "Darwin/macOS"):
                 with orchestrator.state_lock(self.root):
                     pass
             self.assertFalse((outside / ".lock").exists())
@@ -1390,7 +1594,7 @@ class WindowsStateBoundaryTests(unittest.TestCase):
         lock.write_bytes(b"retained")
         os.link(lock, second_link)
         try:
-            with self.assertRaisesRegex(orchestrator.FoundryError, "POSIX no-follow directory-FD host"):
+            with self.assertRaisesRegex(orchestrator.FoundryError, "Darwin/macOS"):
                 with orchestrator.state_lock(self.root):
                     pass
             self.assertEqual(lock.read_bytes(), b"retained")
