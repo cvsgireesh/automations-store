@@ -15,6 +15,13 @@
       "independence_key": "gumroad"
     },
     {
+      "url": "https://gumroad.com/discover?query=hermes%20agent",
+      "source_type": "market_search",
+      "parser": "gumroad_search",
+      "fixture": "gumroad-search.html",
+      "independence_key": "gumroad"
+    },
+    {
       "url": "https://pypistats.org/api/packages/hermes-agent/recent",
       "source_type": "adoption_signal",
       "parser": "pypistats_recent",

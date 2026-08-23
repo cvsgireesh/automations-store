@@ -46,6 +46,15 @@ class CollectorTests(unittest.TestCase):
         )
         self.assertEqual(signal.metrics["result_count"], 22)
 
+    def test_parses_live_gumroad_inertia_total(self):
+        signal = parse_gumroad_search(
+            '<html><head><title>Discover | Gumroad</title></head>'
+            '<body><div data-page="{&quot;props&quot;:{&quot;total&quot;:22}}"></div></body></html>',
+            "https://gumroad.com/discover?query=hermes%20agent",
+            "2026-08-23T00:00:00Z",
+        )
+        self.assertEqual(signal.metrics["result_count"], 22)
+
     def test_parses_official_release(self):
         signal = parse_github_release(
             fixture("github-release.json"),
@@ -70,11 +79,11 @@ class CollectorTests(unittest.TestCase):
         config = json.loads((FIXTURES.parent.parent / "config.json").read_text(encoding="utf-8"))
         signals = collect(config, "2026-08-23T00:00:00Z", FIXTURES)
         self.assertEqual([signal.source_type for signal in signals], [
-            "paid_comparable", "adoption_signal", "official_release"
+            "paid_comparable", "market_search", "adoption_signal", "official_release"
         ])
         self.assertEqual(
             [signal.independence_key for signal in signals],
-            ["gumroad", "pypistats", "github"],
+            ["gumroad", "gumroad", "pypistats", "github"],
         )
 
     def test_collect_rejects_provider_key_conflict(self):

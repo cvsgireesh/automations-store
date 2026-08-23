@@ -109,10 +109,18 @@ def parse_gumroad_search(html_text: str, url: str, observed_at: str,
                          independence_key: str = "gumroad") -> Signal:
     decoded = html.unescape(html_text)
     title = _required_text(decoded, r"<title[^>]*>(.*?)</title>")
-    result_count = _required_int(
-        decoded,
-        r'(?:data-results-count\s*=\s*"|\b)(\d+)\s+(?:products?|results?)',
-    )
+    result_count_match = None
+    for pattern in (
+        r'data-results-count\s*=\s*"(\d+)"',
+        r'"total"\s*:\s*(\d+)',
+        r'\b(\d+)\s+(?:products?|results?)',
+    ):
+        result_count_match = re.search(pattern, decoded, flags=re.IGNORECASE)
+        if result_count_match:
+            break
+    if result_count_match is None:
+        raise ValueError("required Gumroad search result count is missing")
+    result_count = int(result_count_match.group(1))
     return Signal(
         signal_id=stable_id(url, observed_at[:10]),
         source_url=url,
