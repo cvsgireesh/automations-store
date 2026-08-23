@@ -16,7 +16,7 @@ class Signal:
     title: str
     metrics: dict[str, MetricValue]
     content_sha256: str
-    independence_key: str
+    independence_key: str = ""
 
 
 @dataclass(frozen=True)

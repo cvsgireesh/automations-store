@@ -27,7 +27,7 @@ def signal(signal_id: str, source_url: str, source_type: str, metrics: dict,
         signal_id,
         metrics,
         "hash",
-        independence_key,
+        independence_key=independence_key,
     )
 
 
@@ -40,10 +40,28 @@ def official_signal() -> Signal:
 
 
 def buyer_signal() -> Signal:
-    return signal("buyer", "https://github.com/example/project/issues/99", "buyer_pain", {}, "buyer_forum")
+    return signal(
+        "buyer",
+        "https://pypistats.org/api/packages/hermes-agent/recent",
+        "adoption_signal",
+        {},
+        "pypistats",
+    )
 
 
 class GateTests(unittest.TestCase):
+    def test_signal_supports_original_seven_argument_constructor(self):
+        legacy_signal = Signal(
+            "legacy",
+            "https://gumroad.com/l/hermes",
+            "paid_comparable",
+            OBSERVED_AT,
+            "Legacy signal",
+            {"sales_count": 1},
+            "hash",
+        )
+        self.assertEqual(legacy_signal.independence_key, "")
+
     def test_new_sku_requires_three_independent_signals_and_paid_comparable(self):
         decision = evaluate(candidate(), [paid_signal(), official_signal(), buyer_signal()], set())
         self.assertTrue(decision.passed)
@@ -83,6 +101,36 @@ class GateTests(unittest.TestCase):
         decision = evaluate(
             candidate(("paid", "official", "github-issue")),
             [paid_signal(), official_signal(), github_issue],
+            set(),
+        )
+        self.assertEqual(decision.reasons, ("need_at_least_3_independent_signals",))
+
+    def test_conflicting_github_key_does_not_create_independent_evidence(self):
+        mislabeled_github_issue = signal(
+            "github-issue",
+            "https://github.com/example/project/issues/99",
+            "buyer_pain",
+            {},
+            "buyer_forum",
+        )
+        decision = evaluate(
+            candidate(("paid", "official", "github-issue")),
+            [paid_signal(), official_signal(), mislabeled_github_issue],
+            set(),
+        )
+        self.assertEqual(decision.reasons, ("need_at_least_3_independent_signals",))
+
+    def test_unknown_provider_does_not_create_independent_evidence(self):
+        unknown_provider = signal(
+            "unknown",
+            "https://example.org/research",
+            "buyer_pain",
+            {},
+            "buyer_forum",
+        )
+        decision = evaluate(
+            candidate(("paid", "official", "unknown")),
+            [paid_signal(), official_signal(), unknown_provider],
             set(),
         )
         self.assertEqual(decision.reasons, ("need_at_least_3_independent_signals",))

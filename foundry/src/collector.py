@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .models import Signal
+from .providers import provider_key_for_url
 
 
 TIMEOUT_SECONDS = 20
@@ -93,14 +94,14 @@ def parse_gumroad_product(html_text: str, url: str, observed_at: str,
     ratings = _required_int(decoded, r'"ratings"\s*:\s*\{\s*"count"\s*:\s*(\d+)')
     title = _required_text(decoded, r"<title[^>]*>(.*?)</title>")
     return Signal(
-        stable_id(url, observed_at[:10]),
-        url,
-        "paid_comparable",
-        observed_at,
-        title,
-        {"price": price, "sales_count": sales, "rating_count": ratings},
-        sha256(decoded),
-        independence_key,
+        signal_id=stable_id(url, observed_at[:10]),
+        source_url=url,
+        source_type="paid_comparable",
+        observed_at=observed_at,
+        title=title,
+        metrics={"price": price, "sales_count": sales, "rating_count": ratings},
+        content_sha256=sha256(decoded),
+        independence_key=independence_key,
     )
 
 
@@ -113,14 +114,14 @@ def parse_gumroad_search(html_text: str, url: str, observed_at: str,
         r'(?:data-results-count\s*=\s*"|\b)(\d+)\s+(?:products?|results?)',
     )
     return Signal(
-        stable_id(url, observed_at[:10]),
-        url,
-        "market_search",
-        observed_at,
-        title,
-        {"result_count": result_count},
-        sha256(decoded),
-        independence_key,
+        signal_id=stable_id(url, observed_at[:10]),
+        source_url=url,
+        source_type="market_search",
+        observed_at=observed_at,
+        title=title,
+        metrics={"result_count": result_count},
+        content_sha256=sha256(decoded),
+        independence_key=independence_key,
     )
 
 
@@ -138,14 +139,14 @@ def parse_github_release(json_text: str, url: str, observed_at: str,
     if not all(isinstance(value, str) and value for value in (tag_name, title, published_at)):
         raise ValueError("GitHub release response is missing required fields")
     return Signal(
-        stable_id(url, observed_at[:10]),
-        url,
-        "official_release",
-        observed_at,
-        title,
-        {"tag_name": tag_name, "published_at": published_at},
-        sha256(json_text),
-        independence_key,
+        signal_id=stable_id(url, observed_at[:10]),
+        source_url=url,
+        source_type="official_release",
+        observed_at=observed_at,
+        title=title,
+        metrics={"tag_name": tag_name, "published_at": published_at},
+        content_sha256=sha256(json_text),
+        independence_key=independence_key,
     )
 
 
@@ -169,14 +170,14 @@ def parse_pypistats_recent(json_text: str, url: str, observed_at: str,
             raise ValueError(f"PyPIStats response is missing valid {period}")
         metrics[period] = value
     return Signal(
-        stable_id(url, observed_at[:10]),
-        url,
-        "adoption_signal",
-        observed_at,
-        f"PyPI download activity for {package}",
-        metrics,
-        sha256(json_text),
-        independence_key,
+        signal_id=stable_id(url, observed_at[:10]),
+        source_url=url,
+        source_type="adoption_signal",
+        observed_at=observed_at,
+        title=f"PyPI download activity for {package}",
+        metrics=metrics,
+        content_sha256=sha256(json_text),
+        independence_key=independence_key,
     )
 
 
@@ -231,6 +232,11 @@ def collect(config: Mapping[str, Any] | str | Path, observed_at: str,
         if not isinstance(independence_key, str) or not independence_key.strip():
             raise ValueError("each source requires a non-empty independence_key")
         _validate_url(url, allowed_hosts)
+        provider_key = provider_key_for_url(url)
+        if not provider_key:
+            raise ValueError("source hostname has no controlled provider key")
+        if independence_key.casefold().strip() != provider_key:
+            raise ValueError("configured independence_key conflicts with source provider")
         parser = PARSERS.get(parser_name)
         if parser is None:
             raise ValueError(f"unsupported source parser: {parser_name}")
@@ -241,7 +247,7 @@ def collect(config: Mapping[str, Any] | str | Path, observed_at: str,
             if not isinstance(fixture_name, str):
                 raise ValueError("fixture collection requires each source fixture name")
             response_text = _read_fixture(root, fixture_name)
-        signal = parser(response_text, url, observed_at, independence_key)
+        signal = parser(response_text, url, observed_at, independence_key=provider_key)
         configured_type = source.get("source_type")
         if configured_type is not None and configured_type != signal.source_type:
             raise ValueError("configured source type does not match parser output")

@@ -60,7 +60,7 @@ class CollectorTests(unittest.TestCase):
             fixture("pypistats-recent.json"),
             "https://pypistats.org/api/packages/hermes-agent/recent",
             "2026-08-23T00:00:00Z",
-            "pypistats",
+            independence_key="pypistats",
         )
         self.assertEqual(signal.source_type, "adoption_signal")
         self.assertEqual(signal.metrics["last_month"], 1098)
@@ -76,6 +76,12 @@ class CollectorTests(unittest.TestCase):
             [signal.independence_key for signal in signals],
             ["gumroad", "pypistats", "github"],
         )
+
+    def test_collect_rejects_provider_key_conflict(self):
+        config = json.loads((FIXTURES.parent.parent / "config.json").read_text(encoding="utf-8"))
+        config["sources"][0]["independence_key"] = "github"
+        with self.assertRaises(ValueError):
+            collect(config, "2026-08-23T00:00:00Z", FIXTURES)
 
 
 if __name__ == "__main__":
