@@ -38,6 +38,7 @@ CHICAGO = ZoneInfo("America/Chicago")
 STATE_NAME = "state"
 RUNS_NAME = "runs"
 SIGNALS_FILE = "latest-signals.json"
+COLLECTION_STATUS_FILE = "collection-status.json"
 CANDIDATE_FILE = "current-candidate.json"
 SCOUT_PROPOSAL_FILE = "scout-candidate.json"
 PLATFORM_VERIFICATION_FILE = "platform-verification.json"
@@ -251,6 +252,59 @@ def _latest_signals_unlocked(repo_root: Path) -> list[Signal]:
     return [] if payload is None else _signals_from_payload(payload)
 
 
+def _signal_state_sha256_unlocked(repo_root: Path) -> str | None:
+    """Hash exact persisted last-good bytes without parsing source evidence."""
+    try:
+        content = (_state_root(repo_root) / SIGNALS_FILE).read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(content).hexdigest()
+
+
+def _signal_state_observed_date_unlocked(repo_root: Path) -> str | None:
+    """Read the canonical collection date from the hash-bound signal record."""
+    payload = _read_json(_state_root(repo_root) / SIGNALS_FILE)
+    if not isinstance(payload, Mapping):
+        return None
+    observed_date = payload.get("observed_date")
+    if not isinstance(observed_date, str):
+        return None
+    try:
+        return observed_date if date.fromisoformat(observed_date).isoformat() == observed_date else None
+    except ValueError:
+        return None
+
+
+def _collection_is_stale_unlocked(repo_root: Path) -> bool:
+    """Return whether the last bounded collection failed or its marker is invalid.
+
+    Every success writes a ready marker bound to the exact signal-state bytes.
+    Missing, malformed, failed, or mismatched marker state leaves last-good
+    signals ineligible for a gate until a fresh collection completes.
+    """
+    try:
+        status = _read_json(_state_root(repo_root) / COLLECTION_STATUS_FILE)
+    except FoundryError:
+        return True
+    if not isinstance(status, Mapping) or status.get("status") != "ready":
+        return True
+    expected_digest = status.get("signals_sha256")
+    observed_date = status.get("observed_date")
+    try:
+        marker_date = observed_date if isinstance(observed_date, str) and date.fromisoformat(observed_date).isoformat() == observed_date else None
+    except ValueError:
+        marker_date = None
+    actual_digest = _signal_state_sha256_unlocked(repo_root)
+    return not (
+        isinstance(expected_digest, str)
+        and len(expected_digest) == 64
+        and marker_date is not None
+        and marker_date == _signal_state_observed_date_unlocked(repo_root)
+        and actual_digest is not None
+        and expected_digest == actual_digest
+    )
+
+
 def latest_signals(repo_root: str | Path) -> list[Signal]:
     """Read only the last normalized collector record, never source pages."""
     root = _repo_root(repo_root)
@@ -261,7 +315,7 @@ def latest_signals(repo_root: str | Path) -> list[Signal]:
 def monitor_payload(signals: Sequence[Signal] | Mapping[str, Any]) -> bytes:
     """Return stable monitor bytes containing only meaningful normalized fields.
 
-    Observation dates, per-fetch content hashes, and date-derived signal IDs are
+    Observation dates, per-fetch content hashes, and stable citation IDs are
     deliberately excluded.  Hermes hashes this exact output to suppress a
     local-model run when metrics and meaningful source facts did not change.
     """
@@ -298,6 +352,18 @@ def collect_signals(repo_root: str | Path, observed_date: str | None = None, *,
     except Exception as error:
         with state_lock(root):
             preserved = (_state_root(root) / SIGNALS_FILE).exists()
+            # Do not persist an exception string: it can contain remote or
+            # local details.  The date/status are sufficient to fail the gate
+            # closed while preserving the last good normalized evidence.
+            atomic_write_json(
+                _state_root(root) / COLLECTION_STATUS_FILE,
+                {
+                    "failed_date": observation_date,
+                    "last_good_signals_sha256": _signal_state_sha256_unlocked(root),
+                    "status": "failed",
+                },
+            )
+            _remove_stale_gate_unlocked(root)
         suffix = "last good signals preserved" if preserved else "no good signal record exists"
         raise CollectionError(f"collection failed; {suffix}: {error}") from error
 
@@ -313,6 +379,7 @@ def collect_signals(repo_root: str | Path, observed_date: str | None = None, *,
             "schema_version": 1,
             "signals": [_signal_mapping(signal) for signal in collected],
         }
+        signal_digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
         if changed:
             atomic_write_json(_state_root(root) / SIGNALS_FILE, payload)
             _write_run_report(
@@ -323,6 +390,16 @@ def collect_signals(repo_root: str | Path, observed_date: str | None = None, *,
             )
         else:
             atomic_write_json(_state_root(root) / SIGNALS_FILE, payload)
+        # Persist health after the signal record.  A stop between these writes
+        # leaves a missing/mismatched marker, which gate evaluation rejects.
+        atomic_write_json(
+            _state_root(root) / COLLECTION_STATUS_FILE,
+            {
+                "observed_date": observation_date,
+                "signals_sha256": signal_digest,
+                "status": "ready",
+            },
+        )
     return {
         "changed": changed,
         "signal_count": len(collected),
@@ -416,8 +493,11 @@ def _lexical_absolute(path: str | Path) -> Path:
     return absolute.parent.resolve() / absolute.name
 
 
-def _load_regular_candidate_file(candidate_path: Path) -> tuple[dict[str, Any], tuple[int, int]]:
-    """Read one regular proposal without following a symlink or path swap."""
+ProposalIdentity = tuple[int, int, int, int, str]
+
+
+def _read_regular_candidate_bytes(candidate_path: Path) -> tuple[bytes, ProposalIdentity]:
+    """Read one regular proposal and bind its exact bytes to its inode."""
     try:
         before = candidate_path.lstat()
     except OSError as error:
@@ -430,21 +510,51 @@ def _load_regular_candidate_file(candidate_path: Path) -> tuple[dict[str, Any], 
     except OSError as error:
         raise CandidateError("Scout proposal could not be opened without following links") from error
     try:
-        with os.fdopen(descriptor, "r", encoding="utf-8") as candidate_file:
+        with os.fdopen(descriptor, "rb") as candidate_file:
             opened = os.fstat(candidate_file.fileno())
-            identity = (before.st_dev, before.st_ino)
-            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != identity:
+            opened_inode = (opened.st_dev, opened.st_ino)
+            before_inode = (before.st_dev, before.st_ino)
+            if not stat.S_ISREG(opened.st_mode) or opened_inode != before_inode:
                 raise CandidateError("Scout proposal changed while it was being opened")
             raw = candidate_file.read()
+            after = os.fstat(candidate_file.fileno())
     except OSError as error:
         raise CandidateError(f"cannot read candidate JSON: {candidate_path}") from error
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or (after.st_dev, after.st_ino) != before_inode
+        or after.st_size != len(raw)
+    ):
+        raise CandidateError("Scout proposal changed while it was being read")
+    identity: ProposalIdentity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        hashlib.sha256(raw).hexdigest(),
+    )
+    return raw, identity
+
+
+def _load_regular_candidate_file(candidate_path: Path) -> tuple[dict[str, Any], ProposalIdentity]:
+    """Decode an exact no-follow proposal read for safe staged consumption."""
+    raw, identity = _read_regular_candidate_bytes(candidate_path)
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as error:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise CandidateError(f"cannot read candidate JSON: {candidate_path}") from error
     if not isinstance(payload, Mapping):
         raise CandidateError("candidate JSON must be an object")
     return dict(payload), identity
+
+
+def _proposal_matches_identity(candidate_path: Path, expected: ProposalIdentity) -> bool:
+    """Verify a claimed handoff has not changed through a held descriptor."""
+    try:
+        _, current = _read_regular_candidate_bytes(candidate_path)
+    except CandidateError:
+        return False
+    return current == expected
 
 
 def _claim_scout_proposal(proposal: Path) -> Path:
@@ -489,11 +599,7 @@ def stage_candidate_file(repo_root: str | Path, candidate_path: str | Path, *, c
         candidate, identity = _load_regular_candidate_file(claimed)
         result = stage_candidate(root, candidate)
         try:
-            current = claimed.lstat()
-            if (
-                not stat.S_ISREG(current.st_mode)
-                or (current.st_dev, current.st_ino) != identity
-            ):
+            if not _proposal_matches_identity(claimed, identity):
                 raise CandidateError("Scout proposal changed before it could be consumed")
             claimed.unlink()
         except FileNotFoundError as error:
@@ -669,6 +775,7 @@ def gate_candidate(repo_root: str | Path, payload: Mapping[str, Any], *,
     generated_date = _validated_date(as_of_date)
     with state_lock(root):
         signals = _latest_signals_unlocked(root)
+        collection_stale = _collection_is_stale_unlocked(root)
         released_slugs = _released_slugs_unlocked(root)
         if _has_successful_candidate_unlocked(root, digest):
             passed, reasons, matched_ids = False, ["candidate_already_successfully_released"], []
@@ -677,9 +784,10 @@ def gate_candidate(repo_root: str | Path, payload: Mapping[str, Any], *,
         else:
             passed, reasons, matched_ids = _update_gate(candidate, signals, released_slugs)
         stale_signal_ids = _stale_signal_ids(candidate, signals, generated_date)
-        if stale_signal_ids:
+        if stale_signal_ids or collection_stale:
             passed = False
-            reasons = [*reasons, "stale_signal_evidence"]
+            if "stale_signal_evidence" not in reasons:
+                reasons = [*reasons, "stale_signal_evidence"]
         result = {
             "candidate": candidate,
             "candidate_sha256": digest,
@@ -688,6 +796,7 @@ def gate_candidate(repo_root: str | Path, payload: Mapping[str, Any], *,
             "matched_signal_ids": matched_ids,
             "passed": passed,
             "reasons": reasons,
+            "collection_stale": collection_stale,
             "stale_signal_ids": stale_signal_ids,
         }
         if passed:
@@ -787,7 +896,7 @@ def source_tree_revision(source: str | Path) -> str:
 
     digest = hashlib.sha256()
     digest.update(b"hermes-source-tree-v2\0")
-    for path in sorted(files):
+    for path in sorted(files, key=lambda item: item.relative_to(source_root).as_posix().encode("utf-8")):
         relative_path = path.relative_to(source_root).as_posix().encode("utf-8")
         try:
             content = path.read_bytes()
@@ -995,6 +1104,8 @@ def _release_metadata(repo_root: Path, snapshot_root: Path, source: Path,
 
 
 def _fresh_gate_unlocked(repo_root: Path, slug: str) -> dict[str, Any]:
+    if _collection_is_stale_unlocked(repo_root):
+        raise ReleaseError("latest collection evidence is stale or unverifiable")
     gate = _read_json(_state_root(repo_root) / GATE_FILE)
     if not isinstance(gate, Mapping) or gate.get("passed") is not True:
         raise ReleaseError("a fresh passed gate.json is required before packaging")
@@ -1048,6 +1159,7 @@ def package_release(repo_root: str | Path, slug: str, version: str) -> dict[str,
             raise ReleaseError("a different candidate already owns this successful slug/version")
 
         public_metadata = _read_public_metadata(root, slug, version)
+        _audit_generated_copy({"public-product-metadata.json": public_metadata})
         source = _private_product_source(root, slug)
         archive_path = root / "dist" / "hermespacks" / f"{slug}-{version}.zip"
         manifest_path = archive_path.with_suffix(".manifest.json")

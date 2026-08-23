@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -224,6 +226,16 @@ class InstallerPlanningTests(unittest.TestCase):
         actions = plan_reconcile([stale_pause], (job,))
         self.assertEqual([action.kind for action in actions], ["resume"])
 
+    def test_unsafe_managed_job_ids_are_rejected_before_they_become_cli_arguments(self):
+        job = desired_jobs(ROOT)[0]
+        for unsafe_id in ("--help", "-leading-dash", "contains space", "path/segment", "path\\segment", "line\nbreak"):
+            with self.subTest(job_id=unsafe_id):
+                existing = persisted(job, unsafe_id)
+                existing["enabled"] = False
+                existing["state"] = "paused"
+                with self.assertRaisesRegex(ReconciliationError, "unsafe scheduler id"):
+                    plan_reconcile([existing], (job,))
+
     def test_duplicate_exact_names_fail_closed(self):
         job = desired_jobs(ROOT)[0]
         duplicate = [persisted(job, "one"), persisted(job, "two")]
@@ -361,6 +373,104 @@ class InstallerExecutionTests(unittest.TestCase):
                 )
             self.assertEqual(calls, [])
             self.assertFalse(hermes_home.exists())
+
+    def test_unsafe_paused_job_id_fails_before_assets_or_scheduler_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hermes_home = Path(directory) / ".hermes"
+            jobs = [persisted(job, f"job-{index}") for index, job in enumerate(desired_jobs(ROOT))]
+            jobs[0]["id"] = "--help"
+            jobs[0]["enabled"] = False
+            jobs[0]["state"] = "paused"
+            jobs_path = hermes_home / "cron" / "jobs.json"
+            jobs_path.parent.mkdir(parents=True)
+            jobs_path.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+            commands: list[list[str]] = []
+            with self.assertRaisesRegex(ReconciliationError, "unsafe scheduler id"):
+                run_installer(
+                    ROOT,
+                    hermes_home=hermes_home,
+                    runner=lambda command, environment: commands.append(command),
+                )
+            self.assertEqual(commands, [])
+            self.assertFalse((hermes_home / "scripts").exists())
+            self.assertFalse((hermes_home / "skills").exists())
+
+    def test_real_installer_rejects_a_linked_reconciliation_lock_before_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            hermes_home = base / ".hermes"
+            outside = base / "outside-lock"
+            hermes_home.mkdir()
+            outside.mkdir()
+            (hermes_home / ".foundry-install.lock").symlink_to(outside, target_is_directory=True)
+            commands: list[list[str]] = []
+            with self.assertRaisesRegex(ReconciliationError, "lock"):
+                run_installer(
+                    ROOT,
+                    hermes_home=hermes_home,
+                    runner=lambda command, environment: commands.append(command),
+                )
+            self.assertEqual(commands, [])
+            self.assertFalse((hermes_home / "scripts").exists())
+            self.assertFalse((hermes_home / "skills").exists())
+
+    def test_concurrent_real_installers_serialize_planning_and_create_each_managed_name_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hermes_home = Path(directory) / ".hermes"
+            jobs_path = hermes_home / "cron" / "jobs.json"
+            desired_by_name = {job.name: job for job in desired_jobs(ROOT)}
+            first_command = threading.Event()
+            allow_first_command = threading.Event()
+            write_lock = threading.Lock()
+            commands: list[str] = []
+            results: list[list] = []
+            errors: list[BaseException] = []
+
+            def runner(command, environment):
+                name = command[command.index("--name") + 1]
+                with write_lock:
+                    is_first = not commands
+                    commands.append(name)
+                    if is_first:
+                        first_command.set()
+                if is_first:
+                    if not allow_first_command.wait(timeout=3):
+                        raise RuntimeError("test did not release the first installer")
+                with write_lock:
+                    records = []
+                    if jobs_path.exists():
+                        records = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+                    records.append(persisted(desired_by_name[name], f"job-{len(records)}"))
+                    jobs_path.parent.mkdir(parents=True, exist_ok=True)
+                    jobs_path.write_text(json.dumps({"jobs": records}), encoding="utf-8")
+
+            def invoke():
+                try:
+                    results.append(run_installer(ROOT, hermes_home=hermes_home, runner=runner))
+                except BaseException as error:  # surfaced in the parent test thread below
+                    errors.append(error)
+
+            first = threading.Thread(target=invoke)
+            second = threading.Thread(target=invoke)
+            first.start()
+            self.assertTrue(first_command.wait(timeout=3))
+            second.start()
+            # Without a cross-process-safe home lock, the second installer
+            # plans its four creates while the first runner is paused here.
+            time.sleep(0.15)
+            allow_first_command.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+            self.assertFalse(first.is_alive() or second.is_alive())
+            self.assertEqual(errors, [])
+            names = [record["name"] for record in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]]
+            self.assertEqual(names, list(desired_by_name))
+            self.assertEqual(commands, list(desired_by_name))
+            self.assertEqual(sorted(len(actions) for actions in results), [0, 4])
+            lock_path = hermes_home / ".foundry-install.lock"
+            self.assertTrue(lock_path.is_file())
+            self.assertFalse(lock_path.is_symlink())
+            self.assertEqual(lock_path.stat().st_nlink, 1)
 
     def test_asset_install_rejects_symlinked_parent_and_destination(self):
         with tempfile.TemporaryDirectory() as directory:

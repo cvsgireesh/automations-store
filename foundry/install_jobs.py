@@ -9,7 +9,9 @@ are delegated to narrow, exact-job ``hermes cron create``, ``edit``, or
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
+import errno
 import json
 import os
 from pathlib import Path
@@ -18,7 +20,18 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any, Callable, Iterable, Mapping, Sequence
+import time
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+
+try:  # POSIX hosts use advisory flock; Windows falls back to msvcrt below.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows hosts
+    fcntl = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - unavailable on POSIX test hosts
+    import msvcrt
+except ImportError:  # pragma: no cover - exercised on POSIX hosts
+    msvcrt = None  # type: ignore[assignment]
 
 
 SCRIPT_NAMES = (
@@ -29,6 +42,10 @@ SCRIPT_NAMES = (
 )
 SKILL_NAME = "hermes-product-foundry"
 PROFILE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+INSTALLER_LOCK_FILE = ".foundry-install.lock"
+LOCK_TIMEOUT_SECONDS = 30.0
+LOCK_RETRY_SECONDS = 0.05
 
 
 class ReconciliationError(RuntimeError):
@@ -326,6 +343,18 @@ def _attachment_value(record: Mapping[str, Any]) -> bool | None:
     raise ReconciliationError("managed job has malformed attach_to_session")
 
 
+def _raw_job_id(value: Any) -> str | None:
+    """Preserve persisted job-ID bytes for positional CLI validation."""
+    return value if isinstance(value, str) else None
+
+
+def _safe_job_id(value: str | None, job_name: str) -> str:
+    """Return a conservative positional ID, never a possible CLI flag/path."""
+    if not isinstance(value, str) or not SAFE_JOB_ID.fullmatch(value):
+        raise ReconciliationError(f"managed job has unsafe scheduler id: {job_name}")
+    return value
+
+
 def normalize_existing(record: Job | Mapping[str, Any]) -> tuple[str | None, dict[str, Any], str | None]:
     """Normalize legacy Hermes records into exactly the fields we own."""
     if isinstance(record, Job):
@@ -333,7 +362,7 @@ def normalize_existing(record: Job | Mapping[str, Any]) -> tuple[str | None, dic
     if not isinstance(record, Mapping):
         raise ReconciliationError("cron jobs.json contains a non-object job record")
     name = _text(record.get("name"))
-    job_id = _text(record.get("id"))
+    job_id = _raw_job_id(record.get("id"))
     provider = _text(record.get("provider")) or _text(record.get("model_provider"))
     continuity, nonself_context = _context_from(record, job_id)
     repeat_configured, repeat_times = _repeat_shape(record)
@@ -405,13 +434,9 @@ def plan_reconcile(existing: Sequence[Job | Mapping[str, Any]], desired: Sequenc
             for field in ("enabled", "state", "paused_at", "paused_reason")
         )
         if needs_update:
-            if not job_id:
-                raise ReconciliationError(f"managed job lacks a scheduler id: {job.name}")
-            actions.append(Action("update", job, job_id))
+            actions.append(Action("update", job, _safe_job_id(job_id, job.name)))
         if needs_resume:
-            if not job_id:
-                raise ReconciliationError(f"managed job lacks a scheduler id: {job.name}")
-            actions.append(Action("resume", job, job_id))
+            actions.append(Action("resume", job, _safe_job_id(job_id, job.name)))
     return actions
 
 
@@ -534,6 +559,117 @@ def _safe_directory_chain(home: Path, destination_parent: Path) -> None:
             raise ReconciliationError(f"installed asset parent is not a directory: {current}")
 
 
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _safe_lock_stat(lock_path: Path, *, missing_ok: bool = False) -> os.stat_result | None:
+    """Inspect the persistent lock pathname without following a link."""
+    try:
+        details = lock_path.lstat()
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise ReconciliationError("Foundry installer lock disappeared") from None
+    except OSError as error:
+        raise ReconciliationError("cannot inspect Foundry installer lock") from error
+    if (
+        lock_path.is_symlink()
+        or _is_reparse_point(lock_path, details)
+        or not stat.S_ISREG(details.st_mode)
+        or details.st_nlink != 1
+    ):
+        raise ReconciliationError("Foundry installer lock is not a safe regular file")
+    return details
+
+
+def _open_installer_lock(home: Path) -> tuple[Path, int]:
+    """Open one persistent safe lock inode without unlinking or replacing it."""
+    _safe_directory_chain(home, home)
+    lock_path = home / INSTALLER_LOCK_FILE
+    before = _safe_lock_stat(lock_path, missing_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise ReconciliationError("cannot open Foundry installer lock") from error
+    try:
+        opened = os.fstat(descriptor)
+        after = _safe_lock_stat(lock_path)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or after is None
+            or not _same_file(opened, after)
+            or (before is not None and not _same_file(before, opened))
+        ):
+            raise ReconciliationError("Foundry installer lock changed while opening")
+        if opened.st_size == 0:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        return lock_path, descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _wait_for_installer_lock(descriptor: int) -> None:
+    """Acquire a one-byte OS lock with a bounded wait on every host."""
+    deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+    if fcntl is not None:
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise ReconciliationError("cannot acquire Foundry installer lock") from error
+                if time.monotonic() >= deadline:
+                    raise ReconciliationError("timed out waiting for Foundry installer lock") from error
+                time.sleep(LOCK_RETRY_SECONDS)
+    if msvcrt is None:  # pragma: no cover - every supported host has one backend
+        raise ReconciliationError("no supported Foundry installer lock backend")
+    while True:  # pragma: no cover - exercised on Windows hosts
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as error:
+            if time.monotonic() >= deadline:
+                raise ReconciliationError("timed out waiting for Foundry installer lock") from error
+            time.sleep(LOCK_RETRY_SECONDS)
+
+
+def _release_installer_lock(descriptor: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:  # pragma: no cover - exercised on Windows hosts
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+
+
+@contextmanager
+def _installer_lock(home: Path) -> Iterator[None]:
+    """Serialize read-plan-assets-CLI reconciliation for one Hermes home."""
+    lock_path, descriptor = _open_installer_lock(home)
+    acquired = False
+    try:
+        _wait_for_installer_lock(descriptor)
+        acquired = True
+        # A replacement after open would let separate processes lock different
+        # inodes, so validate the pathname again while our descriptor is held.
+        current = _safe_lock_stat(lock_path)
+        if current is None or not _same_file(os.fstat(descriptor), current):
+            raise ReconciliationError("Foundry installer lock changed while acquiring")
+        yield
+    finally:
+        if acquired:
+            _release_installer_lock(descriptor)
+        os.close(descriptor)
+
+
 def _atomic_copy(source: Path, destination: Path, mode: int, home: Path) -> None:
     """Copy one approved local asset atomically through safe lexical parents."""
     try:
@@ -627,21 +763,26 @@ def _subprocess_runner(command: list[str], environment: Mapping[str, str]) -> No
 
 def run_installer(repo_root: str | Path | None = None, *, hermes_home: str | Path | None = None,
                   dry_run: bool = False, hermes_bin: str = "hermes", runner: Runner | None = None) -> list[Action]:
-    """Plan then, only when requested, deploy assets and invoke Hermes CLI changes."""
+    """Serialize a real read-plan-assets-CLI reconciliation for one Hermes home."""
     root = _repo_root(repo_root)
     home = Path(hermes_home) if hermes_home is not None else Path.home() / ".hermes"
     home_path = Path(os.path.abspath(os.fspath(home.expanduser())))
+    # Named profiles must already exist; reject them before creating a real
+    # lock.  The dry-run branch remains wholly read-only.
     profile = _profile_for_home(home_path)
-    actions = plan_reconcile(load_existing_jobs(home), desired_jobs(root))
     if dry_run:
+        return plan_reconcile(load_existing_jobs(home_path), desired_jobs(root))
+    with _installer_lock(home_path):
+        # Re-read all mutable scheduler state inside the home-scoped lock.
+        profile = _profile_for_home(home_path)
+        actions = plan_reconcile(load_existing_jobs(home_path), desired_jobs(root))
+        install_assets(root, home_path)
+        execute = runner or _subprocess_runner
+        environment = dict(os.environ)
+        environment["HERMES_HOME"] = str(home_path)
+        for action in actions:
+            execute(action.command(hermes_bin, profile), environment)
         return actions
-    install_assets(root, home)
-    execute = runner or _subprocess_runner
-    environment = dict(os.environ)
-    environment["HERMES_HOME"] = str(home_path)
-    for action in actions:
-        execute(action.command(hermes_bin, profile), environment)
-    return actions
 
 
 def main(argv: list[str] | None = None) -> int:

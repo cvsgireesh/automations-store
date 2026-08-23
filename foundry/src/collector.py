@@ -28,9 +28,20 @@ def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def stable_id(url: str, observed_date: str) -> str:
-    """Return a deterministic identifier for one source observed on one date."""
-    return sha256(f"{url}\n{observed_date}")
+def stable_id(url: str, source_type: str, independence_key: str) -> str:
+    """Return a stable identity for one configured source, not one fetch.
+
+    Freshness and response bytes are tracked independently on ``Signal``.
+    Candidates cite this source identity, so it must survive a successful
+    daily refresh even when observation timestamps or response hashes change.
+    """
+    source_identity = "\n".join((
+        "hermes-foundry-signal-v2",
+        source_type.strip().casefold(),
+        independence_key.strip().casefold(),
+        url.strip(),
+    ))
+    return sha256(source_identity)
 
 
 def _validate_url(url: str, allowed_hosts: set[str]) -> None:
@@ -97,7 +108,7 @@ def parse_gumroad_product(html_text: str, url: str, observed_at: str,
     ratings = _required_int(decoded, r'"ratings"\s*:\s*\{\s*"count"\s*:\s*(\d+)')
     title = _required_text(decoded, r"<title[^>]*>(.*?)</title>")
     return Signal(
-        signal_id=stable_id(url, observed_at[:10]),
+        signal_id=stable_id(url, "paid_comparable", independence_key),
         source_url=url,
         source_type="paid_comparable",
         observed_at=observed_at,
@@ -125,7 +136,7 @@ def parse_gumroad_search(html_text: str, url: str, observed_at: str,
         raise ValueError("required Gumroad search result count is missing")
     result_count = int(result_count_match.group(1))
     return Signal(
-        signal_id=stable_id(url, observed_at[:10]),
+        signal_id=stable_id(url, "market_search", independence_key),
         source_url=url,
         source_type="market_search",
         observed_at=observed_at,
@@ -150,7 +161,7 @@ def parse_github_release(json_text: str, url: str, observed_at: str,
     if not all(isinstance(value, str) and value for value in (tag_name, title, published_at)):
         raise ValueError("GitHub release response is missing required fields")
     return Signal(
-        signal_id=stable_id(url, observed_at[:10]),
+        signal_id=stable_id(url, "official_release", independence_key),
         source_url=url,
         source_type="official_release",
         observed_at=observed_at,
@@ -181,7 +192,7 @@ def parse_pypistats_recent(json_text: str, url: str, observed_at: str,
             raise ValueError(f"PyPIStats response is missing valid {period}")
         metrics[period] = value
     return Signal(
-        signal_id=stable_id(url, observed_at[:10]),
+        signal_id=stable_id(url, "adoption_signal", independence_key),
         source_url=url,
         source_type="adoption_signal",
         observed_at=observed_at,

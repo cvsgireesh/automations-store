@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -80,21 +82,33 @@ class OrchestratorTests(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def write_signals(self, signals: list[Signal]) -> None:
+        signal_path = self.root / "foundry" / "state" / "latest-signals.json"
         atomic_write_json(
-            self.root / "foundry" / "state" / "latest-signals.json",
-            {"signals": [
-                {
-                    "signal_id": item.signal_id,
-                    "source_url": item.source_url,
-                    "source_type": item.source_type,
-                    "observed_at": item.observed_at,
-                    "title": item.title,
-                    "metrics": item.metrics,
-                    "content_sha256": item.content_sha256,
-                    "independence_key": item.independence_key,
-                }
-                for item in signals
-            ]},
+            signal_path,
+            {
+                "observed_date": signals[0].observed_at[:10] if signals else "2026-08-23",
+                "signals": [
+                    {
+                        "signal_id": item.signal_id,
+                        "source_url": item.source_url,
+                        "source_type": item.source_type,
+                        "observed_at": item.observed_at,
+                        "title": item.title,
+                        "metrics": item.metrics,
+                        "content_sha256": item.content_sha256,
+                        "independence_key": item.independence_key,
+                    }
+                    for item in signals
+                ],
+            },
+        )
+        atomic_write_json(
+            self.root / "foundry" / "state" / "collection-status.json",
+            {
+                "observed_date": signals[0].observed_at[:10] if signals else "2026-08-23",
+                "signals_sha256": hashlib.sha256(signal_path.read_bytes()).hexdigest(),
+                "status": "ready",
+            },
         )
 
     def write_packagable_product(self, slug: str = "hermes-hybrid-operator-kit", *,
@@ -174,6 +188,105 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(refreshed_payload["observed_date"], "2026-08-24")
         self.assertTrue(all("2026-08-24" in item["observed_at"] for item in refreshed_payload["signals"]))
         self.assertEqual(monitor_payload(json.loads(before)), monitor_payload(refreshed_payload))
+
+    def test_staged_candidate_citations_survive_a_multiday_unchanged_collection(self):
+        config = json.loads((REPO_ROOT / "foundry" / "config.json").read_text(encoding="utf-8"))
+        collect_signals(self.root, "2026-08-23", config=config, fixture_dir=FIXTURES)
+        cited = [
+            item.signal_id
+            for item in latest_signals(self.root)
+            if item.source_type in {"paid_comparable", "adoption_signal", "official_release"}
+        ]
+        candidate = new_candidate("multiday-kit")
+        candidate["signal_ids"] = cited
+        stage_candidate(self.root, candidate)
+        refreshed = collect_signals(self.root, "2026-08-24", config=config, fixture_dir=FIXTURES)
+        self.assertFalse(refreshed["changed"])
+        with mock.patch("foundry.src.orchestrator.chicago_date", return_value="2026-08-24"):
+            gate = gate_current_candidate(self.root)
+        self.assertTrue(gate and gate["passed"], gate)
+
+    def test_failed_collection_immediately_makes_preserved_evidence_gate_ineligible_until_recovery(self):
+        config = json.loads((REPO_ROOT / "foundry" / "config.json").read_text(encoding="utf-8"))
+        collect_signals(self.root, "2026-08-23", config=config, fixture_dir=FIXTURES)
+        candidate = new_candidate("collection-health-kit")
+        candidate["signal_ids"] = [
+            item.signal_id
+            for item in latest_signals(self.root)
+            if item.source_type in {"paid_comparable", "adoption_signal", "official_release"}
+        ]
+        self.assertTrue(gate_candidate(self.root, candidate, as_of_date="2026-08-23")["passed"])
+        before = (self.root / "foundry" / "state" / "latest-signals.json").read_bytes()
+        with mock.patch("foundry.src.orchestrator.collect", side_effect=ValueError("source unavailable")):
+            with self.assertRaises(CollectionError):
+                collect_signals(self.root, "2026-08-24", config=config, fixture_dir=FIXTURES)
+        self.assertEqual((self.root / "foundry" / "state" / "latest-signals.json").read_bytes(), before)
+        failed_gate = gate_candidate(self.root, candidate, as_of_date="2026-08-24")
+        self.assertFalse(failed_gate["passed"])
+        self.assertIn("stale_signal_evidence", failed_gate["reasons"])
+        status_path = self.root / "foundry" / "state" / "collection-status.json"
+        self.assertTrue(status_path.is_file())
+        self.assertEqual(json.loads(status_path.read_text(encoding="utf-8"))["status"], "failed")
+        collect_signals(self.root, "2026-08-25", config=config, fixture_dir=FIXTURES)
+        self.assertTrue(status_path.is_file())
+        self.assertEqual(json.loads(status_path.read_text(encoding="utf-8"))["status"], "ready")
+        self.assertTrue(gate_candidate(self.root, candidate, as_of_date="2026-08-25")["passed"])
+
+    def test_gate_requires_a_matching_successful_collection_marker(self):
+        config = json.loads((REPO_ROOT / "foundry" / "config.json").read_text(encoding="utf-8"))
+        collect_signals(self.root, "2026-08-23", config=config, fixture_dir=FIXTURES)
+        candidate = new_candidate("marker-integrity-kit")
+        candidate["signal_ids"] = [
+            item.signal_id
+            for item in latest_signals(self.root)
+            if item.source_type in {"paid_comparable", "adoption_signal", "official_release"}
+        ]
+        status_path = self.root / "foundry" / "state" / "collection-status.json"
+        signal_path = self.root / "foundry" / "state" / "latest-signals.json"
+        self.assertTrue(status_path.is_file())
+        ready = json.loads(status_path.read_text(encoding="utf-8"))
+        self.assertEqual(ready["status"], "ready")
+        self.assertEqual(ready["signals_sha256"], hashlib.sha256(signal_path.read_bytes()).hexdigest())
+
+        status_path.unlink()
+        missing = gate_candidate(self.root, candidate, as_of_date="2026-08-23")
+        self.assertFalse(missing["passed"])
+        self.assertIn("stale_signal_evidence", missing["reasons"])
+
+        collect_signals(self.root, "2026-08-24", config=config, fixture_dir=FIXTURES)
+        ready = json.loads(status_path.read_text(encoding="utf-8"))
+        ready.pop("observed_date")
+        atomic_write_json(status_path, ready)
+        missing_date = gate_candidate(self.root, candidate, as_of_date="2026-08-24")
+        self.assertFalse(missing_date["passed"])
+        self.assertIn("stale_signal_evidence", missing_date["reasons"])
+
+        collect_signals(self.root, "2026-08-24", config=config, fixture_dir=FIXTURES)
+        ready = json.loads(status_path.read_text(encoding="utf-8"))
+        ready["observed_date"] = "not-a-date"
+        atomic_write_json(status_path, ready)
+        invalid_date = gate_candidate(self.root, candidate, as_of_date="2026-08-24")
+        self.assertFalse(invalid_date["passed"])
+        self.assertIn("stale_signal_evidence", invalid_date["reasons"])
+
+        collect_signals(self.root, "2026-08-24", config=config, fixture_dir=FIXTURES)
+        ready = json.loads(status_path.read_text(encoding="utf-8"))
+        ready["observed_date"] = "2026-08-23"
+        atomic_write_json(status_path, ready)
+        mismatched_date = gate_candidate(self.root, candidate, as_of_date="2026-08-24")
+        self.assertFalse(mismatched_date["passed"])
+        self.assertIn("stale_signal_evidence", mismatched_date["reasons"])
+
+        collect_signals(self.root, "2026-08-24", config=config, fixture_dir=FIXTURES)
+        atomic_write_json(status_path, {"status": "ready", "signals_sha256": "wrong"})
+        mismatched = gate_candidate(self.root, candidate, as_of_date="2026-08-24")
+        self.assertFalse(mismatched["passed"])
+        self.assertIn("stale_signal_evidence", mismatched["reasons"])
+
+        status_path.write_text("not json", encoding="utf-8")
+        malformed = gate_candidate(self.root, candidate, as_of_date="2026-08-24")
+        self.assertFalse(malformed["passed"])
+        self.assertIn("stale_signal_evidence", malformed["reasons"])
 
     def test_task6_candidate_fixture_passes_against_collected_fixture_signals(self):
         config = json.loads((REPO_ROOT / "foundry" / "config.json").read_text(encoding="utf-8"))
@@ -386,6 +499,28 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(proposal.exists())
         self.assertEqual(json.loads(proposal.read_text(encoding="utf-8"))["slug"], "second-kit")
 
+    def test_held_descriptor_rewrite_of_claimed_proposal_is_preserved_not_deleted(self):
+        proposal = self.root / "foundry" / "state" / "scout-candidate.json"
+        proposal.write_text(json.dumps(new_candidate("first-kit")), encoding="utf-8")
+        from foundry.src import orchestrator
+
+        original_stage = orchestrator.stage_candidate
+        with proposal.open("r+", encoding="utf-8") as producer:
+            def stage_then_rewrite(root, payload):
+                result = original_stage(root, payload)
+                producer.seek(0)
+                producer.write(json.dumps(new_candidate("second-kit")))
+                producer.truncate()
+                producer.flush()
+                os.fsync(producer.fileno())
+                return result
+
+            with mock.patch.object(orchestrator, "stage_candidate", side_effect=stage_then_rewrite):
+                with self.assertRaisesRegex(CandidateError, "changed"):
+                    stage_candidate_file(self.root, proposal, consume=True)
+        self.assertTrue(proposal.exists())
+        self.assertEqual(json.loads(proposal.read_text(encoding="utf-8"))["slug"], "second-kit")
+
     def test_package_writes_verified_manifest_and_truthful_listing_without_publication(self):
         slug = "hermes-hybrid-operator-kit"
         source = self.root / "private-products" / slug
@@ -457,6 +592,19 @@ class OrchestratorTests(unittest.TestCase):
         (second / "a").write_bytes(b"x")
         (second / "b").write_bytes(b"y")
         self.assertNotEqual(source_tree_revision(first), source_tree_revision(second))
+
+    def test_source_tree_revision_uses_relative_posix_order_not_host_path_order(self):
+        source = self.root / "private-products" / "ordered-kit"
+        source.mkdir(parents=True)
+        (source / "Z").write_text("uppercase\n", encoding="utf-8")
+        (source / "a").write_text("lowercase\n", encoding="utf-8")
+        canonical = source_tree_revision(source)
+
+        def reverse_path_order(left, right):
+            return str(left) > str(right)
+
+        with mock.patch.object(type(source), "__lt__", new=reverse_path_order):
+            self.assertEqual(source_tree_revision(source), canonical)
 
     def test_package_audits_a_snapshot_before_a_symlinked_test_can_execute(self):
         slug = "hermes-hybrid-operator-kit"
@@ -542,6 +690,22 @@ class OrchestratorTests(unittest.TestCase):
         for suffix, overrides, finding in cases:
             with self.subTest(finding=finding):
                 slug = f"claim-{suffix}"
+                self.write_packagable_product(slug, metadata_overrides=overrides)
+                self.write_signals(accepted_signals())
+                gate_candidate(self.root, new_candidate(slug))
+                with self.assertRaisesRegex(ReleaseError, finding):
+                    package_release(self.root, slug, "1.0.0")
+                self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
+
+    def test_all_public_metadata_copy_fields_are_claim_audited_before_output(self):
+        cases = (
+            ("description-bestseller", {"description": "Best-selling operator kit."}, "unsupported_bestseller"),
+            ("extra-social", {"public_copy": "Built for hundreds of developers."}, "unsupported_social_proof"),
+            ("extra-lifetime", {"support_copy": "Lifetime updates."}, "unsupported_lifetime"),
+        )
+        for suffix, overrides, finding in cases:
+            with self.subTest(finding=finding):
+                slug = f"metadata-{suffix}"
                 self.write_packagable_product(slug, metadata_overrides=overrides)
                 self.write_signals(accepted_signals())
                 gate_candidate(self.root, new_candidate(slug))

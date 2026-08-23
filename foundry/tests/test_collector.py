@@ -35,6 +35,39 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(signal.metrics["price"], 14.67)
         self.assertEqual(signal.metrics["rating_count"], 1)
 
+    def test_signal_identity_is_stable_across_observation_dates(self):
+        first = parse_gumroad_product(
+            fixture("gumroad-product.html"),
+            "https://example.gumroad.com/l/item",
+            "2026-08-23T00:00:00Z",
+        )
+        refreshed = parse_gumroad_product(
+            fixture("gumroad-product.html"),
+            "https://example.gumroad.com/l/item",
+            "2026-08-24T00:00:00Z",
+        )
+        self.assertEqual(first.signal_id, refreshed.signal_id)
+        self.assertNotEqual(first.observed_at, refreshed.observed_at)
+
+    def test_signal_identity_includes_source_type_and_provider(self):
+        shared_source = (
+            '<html><head><title>Shared source</title>'
+            '<meta property="product:price:amount" content="12.00"></head>'
+            '<body>"sales_count": 1, "ratings": {"count": 1}'
+            '<div data-results-count="1"></div></body></html>'
+        )
+        product = parse_gumroad_product(
+            shared_source, "https://gumroad.com/l/shared", "2026-08-23T00:00:00Z", "gumroad"
+        )
+        search = parse_gumroad_search(
+            shared_source, "https://gumroad.com/l/shared", "2026-08-23T00:00:00Z", "gumroad"
+        )
+        alternate_provider = parse_gumroad_product(
+            shared_source, "https://gumroad.com/l/shared", "2026-08-23T00:00:00Z", "another-provider"
+        )
+        self.assertNotEqual(product.signal_id, search.signal_id)
+        self.assertNotEqual(product.signal_id, alternate_provider.signal_id)
+
     def test_rejects_non_allowlisted_url(self):
         with self.assertRaises(ValueError):
             fetch_text("https://example.invalid/private", {"gumroad.com"})
