@@ -18,7 +18,10 @@ from .providers import provider_key_for_url
 
 TIMEOUT_SECONDS = 20
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-USER_AGENT = "HermesProductFoundry/1.0 (bounded public signal collector)"
+USER_AGENT = (
+    "Mozilla/5.0 (compatible; HermesProductFoundry/1.0; "
+    "+https://github.com/Dennis-Gireesh/automations-store)"
+)
 
 
 def sha256(content: str) -> str:
@@ -54,7 +57,7 @@ def fetch_text(url: str, allowed_hosts: set[str]) -> str:
     """Fetch a small public HTTPS response after validating every request URL."""
     normalized_hosts = {host.lower() for host in allowed_hosts}
     _validate_url(url, normalized_hosts)
-    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html, application/json"})
+    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
     opener = build_opener(_AllowlistedRedirectHandler(normalized_hosts))
     try:
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
