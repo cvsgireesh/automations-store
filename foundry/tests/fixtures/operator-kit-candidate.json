@@ -1,0 +1,12 @@
+{
+  "candidate_type": "new_sku",
+  "slug": "hermes-hybrid-operator-kit",
+  "signal_ids": [
+    "715e7efd80e9e18f19f2d28ac1201347bc3930a5cad0c4ec8f2ce190764cfb2b",
+    "e931f6c74f9b7ef4aee258e7146e711fde0e796fffbb41967fe7c3f6273b439f",
+    "795bc9a2b7cd7fd2f9626a1bc8951dbc78466417ad96439554c68d1e2066d642"
+  ],
+  "buyer": "Hermes operators who need a bounded local-first routing setup.",
+  "job_to_be_done": "Route routine Hermes work locally while escalating consequential work through an explicit authority lane.",
+  "product_delta": "Tested configuration generation, redacted preflight, safe installers, routing and rollback checklists, and four failure drills."
+}
