@@ -26,8 +26,11 @@ through:
 (cd .. && python3 -m foundry.src.orchestrator stage-candidate --candidate foundry/state/scout-candidate.json --consume)
 ```
 
-The command removes that exact proposal file only after a successful stage or
-safe same-candidate no-op. Do not write a second proposal path.
+The command atomically claims that exact proposal path and keeps a durable,
+bounded ignored receipt under `foundry/state/scout-receipts` before staging.
+Write only the approved proposal path; never write, alter, or delete a claim
+or receipt. If the receipt quarantine is full, stop and request operator
+recovery rather than replacing or deleting any receipt.
 
 Never build, package, publish, upload, message buyers, access credentials,
 configure payouts, copy third-party work, change payment settings, run

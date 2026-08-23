@@ -55,7 +55,10 @@ class PackagerTests(unittest.TestCase):
         self.assertEqual(manifest.archive_sha256, hashlib.sha256(output_zip.read_bytes()).hexdigest())
         with zipfile.ZipFile(output_zip) as archive:
             release_manifest = json.loads(archive.read("RELEASE-MANIFEST.json"))
-        self.assertEqual(release_manifest["files"]["README.md"], hashlib.sha256(b"A tested product.\n").hexdigest())
+        self.assertEqual(
+            release_manifest["files"]["README.md"],
+            hashlib.sha256((self.source_dir / "README.md").read_bytes()).hexdigest(),
+        )
         self.assertEqual(release_manifest["test_command"], "python3 -m unittest")
         self.assertEqual(release_manifest["tested_platforms"], ["macOS", "Windows"])
         self.assertEqual(release_manifest["source_revision"], "abc123")

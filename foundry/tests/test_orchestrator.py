@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 import zipfile
@@ -37,6 +39,13 @@ from foundry.src.orchestrator import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = REPO_ROOT / "foundry" / "tests" / "fixtures"
 OBSERVED_AT = "2026-08-23T00:00:00-05:00"
+# Windows is a compatibility target.  Authority packaging requires the
+# FD-relative O_DIRECTORY/O_NOFOLLOW snapshot contract and is tested on the
+# POSIX builder host; native Windows instead runs the explicit fail-closed
+# coverage below.
+POSIX_SNAPSHOT_REQUIRED = unittest.skipIf(
+    os.name == "nt", "authority packaging requires the POSIX no-follow snapshot host"
+)
 
 
 def signal(signal_id: str, source_url: str, source_type: str, metrics: dict,
@@ -163,6 +172,26 @@ class OrchestratorTests(unittest.TestCase):
         atomic_write_json(target, {"z": 1, "a": [2]})
         self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"a": [2], "z": 1})
         self.assertEqual(list(target.parent.glob(f".{target.name}.*.tmp")), [])
+
+    def test_state_lock_uses_a_windows_byte_lock_when_fcntl_is_unavailable(self):
+        from foundry.src import orchestrator
+
+        calls: list[tuple[int, int]] = []
+
+        class FakeMsvcrt:
+            LK_NBLCK = 1
+            LK_UNLCK = 2
+
+            @staticmethod
+            def locking(_descriptor, mode, length):
+                calls.append((mode, length))
+
+        with mock.patch.object(orchestrator, "fcntl", None), mock.patch.object(
+            orchestrator, "msvcrt", FakeMsvcrt, create=True
+        ):
+            with orchestrator.state_lock(self.root):
+                self.assertTrue((self.root / "foundry" / "state" / ".lock").is_file())
+        self.assertEqual(calls, [(FakeMsvcrt.LK_NBLCK, 1), (FakeMsvcrt.LK_UNLCK, 1)])
 
     def test_collection_uses_fixtures_and_preserves_last_good_signals_on_failure(self):
         config = json.loads((REPO_ROOT / "foundry" / "config.json").read_text(encoding="utf-8"))
@@ -305,10 +334,15 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_scout_proposal_path_is_consumed_only_after_successful_stage(self):
         proposal = self.root / "foundry" / "state" / "scout-candidate.json"
-        proposal.write_text(json.dumps(new_candidate()), encoding="utf-8")
+        original_bytes = json.dumps(new_candidate()).encode("utf-8")
+        proposal.write_bytes(original_bytes)
         result = stage_candidate_file(self.root, proposal, consume=True)
         self.assertEqual(result["status"], "staged")
         self.assertFalse(proposal.exists())
+        receipts = list((self.root / "foundry" / "state" / "scout-receipts").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        self.assertTrue(receipts[0].name.startswith(hashlib.sha256(original_bytes).hexdigest()))
+        self.assertEqual(receipts[0].read_bytes(), original_bytes)
         other = self.root / "candidate.json"
         other.write_text(json.dumps(new_candidate("other-kit")), encoding="utf-8")
         with self.assertRaises(CandidateError):
@@ -334,12 +368,15 @@ class OrchestratorTests(unittest.TestCase):
             proposal.write_text(json.dumps(new_candidate()), encoding="utf-8")
             completed = subprocess.run(
                 [
-                    "/bin/sh",
-                    "-c",
-                    f'cd .. && "{sys.executable}" -m foundry.src.orchestrator '
-                    "stage-candidate --candidate foundry/state/scout-candidate.json --consume",
+                    sys.executable,
+                    "-m",
+                    "foundry.src.orchestrator",
+                    "stage-candidate",
+                    "--candidate",
+                    "foundry/state/scout-candidate.json",
+                    "--consume",
                 ],
-                cwd=root / "foundry",
+                cwd=root,
                 text=True,
                 capture_output=True,
                 check=False,
@@ -360,6 +397,53 @@ class OrchestratorTests(unittest.TestCase):
         persisted = json.loads((self.root / "foundry" / "state" / "gate.json").read_text(encoding="utf-8"))
         self.assertTrue(persisted["passed"])
         self.assertEqual(persisted["generated_date"], chicago_date())
+
+    def test_passed_gate_records_the_exact_ready_signal_state_hash(self):
+        self.write_signals(accepted_signals())
+        gate = gate_candidate(self.root, new_candidate())
+        signal_bytes = (self.root / "foundry" / "state" / "latest-signals.json").read_bytes()
+        expected_hash = hashlib.sha256(signal_bytes).hexdigest()
+        self.assertEqual(gate.get("signals_sha256"), expected_hash)
+        persisted = json.loads((self.root / "foundry" / "state" / "gate.json").read_text(encoding="utf-8"))
+        self.assertEqual(persisted.get("signals_sha256"), expected_hash)
+
+    def test_changed_same_day_paid_metrics_invalidate_the_old_gate_before_package(self):
+        slug = "hermes-hybrid-operator-kit"
+        self.write_packagable_product(slug)
+        initial_signals = accepted_signals()
+        changed_signals = [
+            Signal(
+                **{
+                    **item.__dict__,
+                    "content_sha256": "changed-paid-content",
+                    "metrics": {"sales_count": 0},
+                }
+            )
+            if item.signal_id == "paid"
+            else item
+            for item in initial_signals
+        ]
+        self.assertEqual(initial_signals[0].signal_id, changed_signals[0].signal_id)
+        with mock.patch("foundry.src.orchestrator.collect", return_value=initial_signals):
+            collect_signals(self.root, "2026-08-23", config={})
+        with mock.patch("foundry.src.orchestrator.chicago_date", return_value="2026-08-23"):
+            gate = gate_candidate(self.root, new_candidate(slug), as_of_date="2026-08-23")
+        self.assertTrue(gate["passed"])
+        old_gate = (self.root / "foundry" / "state" / "gate.json").read_bytes()
+
+        with mock.patch("foundry.src.orchestrator.collect", return_value=changed_signals):
+            refreshed = collect_signals(self.root, "2026-08-23", config={})
+        self.assertTrue(refreshed["changed"])
+        with mock.patch("foundry.src.orchestrator.chicago_date", return_value="2026-08-23"):
+            rejected = gate_candidate(self.root, new_candidate(slug), as_of_date="2026-08-23")
+        self.assertFalse(rejected["passed"])
+        self.assertIn("need_paid_transactional_evidence", rejected["reasons"])
+
+        (self.root / "foundry" / "state" / "gate.json").write_bytes(old_gate)
+        with mock.patch("foundry.src.orchestrator.chicago_date", return_value="2026-08-23"):
+            with self.assertRaisesRegex(ReleaseError, "signal"):
+                package_release(self.root, slug, "1.0.0")
+        self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
 
     def test_update_gate_is_not_blocked_merely_as_a_duplicate(self):
         self.write_signals(accepted_signals())
@@ -433,6 +517,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(result["status"], "noop")
         self.assertFalse((self.root / "dist").exists())
 
+    @POSIX_SNAPSHOT_REQUIRED
     def test_distinct_candidate_cannot_overwrite_an_existing_slug_version(self):
         slug = "hermes-hybrid-operator-kit"
         self.write_packagable_product(slug)
@@ -506,6 +591,15 @@ class OrchestratorTests(unittest.TestCase):
 
         original_stage = orchestrator.stage_candidate
         with proposal.open("r+", encoding="utf-8") as producer:
+            if os.name == "nt":
+                # Windows denies the atomic rename while a producer opens the
+                # handoff without delete sharing.  Refusing before any claim
+                # is the native equivalent of preserving its still-live data.
+                with self.assertRaisesRegex(CandidateError, "claimed atomically"):
+                    stage_candidate_file(self.root, proposal, consume=True)
+                self.assertEqual(json.loads(proposal.read_text(encoding="utf-8"))["slug"], "first-kit")
+                return
+
             def stage_then_rewrite(root, payload):
                 result = original_stage(root, payload)
                 producer.seek(0)
@@ -521,6 +615,109 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(proposal.exists())
         self.assertEqual(json.loads(proposal.read_text(encoding="utf-8"))["slug"], "second-kit")
 
+    def test_post_identity_held_fd_rewrite_is_preserved_in_a_durable_receipt(self):
+        proposal = self.root / "foundry" / "state" / "scout-candidate.json"
+        original_bytes = json.dumps(new_candidate("first-kit")).encode("utf-8")
+        replacement_bytes = json.dumps(new_candidate("second-kit")).encode("utf-8")
+        proposal.write_bytes(original_bytes)
+        original_unlink = Path.unlink
+        with proposal.open("r+b") as producer:
+            if os.name == "nt":
+                # Native Windows rejects the producer-held rename, so no
+                # claim or receipt may be consumed behind that open handle.
+                with self.assertRaisesRegex(CandidateError, "claimed atomically"):
+                    stage_candidate_file(self.root, proposal, consume=True)
+                self.assertEqual(proposal.read_bytes(), original_bytes)
+                self.assertFalse((self.root / "foundry" / "state" / "scout-receipts").exists())
+                return
+
+            def rewrite_then_unlink(path, *args, **kwargs):
+                if ".scout-candidate.json.claim-" in path.name:
+                    producer.seek(0)
+                    producer.write(replacement_bytes)
+                    producer.truncate()
+                    producer.flush()
+                    os.fsync(producer.fileno())
+                return original_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "unlink", new=rewrite_then_unlink):
+                result = stage_candidate_file(self.root, proposal, consume=True)
+        self.assertEqual(result["status"], "staged")
+        self.assertFalse(proposal.exists())
+        receipts = list((self.root / "foundry" / "state" / "scout-receipts").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        self.assertTrue(receipts[0].name.startswith(hashlib.sha256(original_bytes).hexdigest()))
+        self.assertEqual(receipts[0].read_bytes(), replacement_bytes)
+
+    def test_full_receipt_quarantine_refuses_consumption_and_preserves_the_proposal(self):
+        proposal = self.root / "foundry" / "state" / "scout-candidate.json"
+        proposal.write_text(json.dumps(new_candidate()), encoding="utf-8")
+        receipts = self.root / "foundry" / "state" / "scout-receipts"
+        receipts.mkdir()
+        for number in range(32):
+            (receipts / f"{number:064x}.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(CandidateError, "receipt quarantine"):
+            stage_candidate_file(self.root, proposal, consume=True)
+        self.assertTrue(proposal.is_file())
+
+    def test_receipt_capacity_remains_bounded_during_simultaneous_claims(self):
+        """Two fresh handoffs cannot both reserve the final receipt slot."""
+        from foundry.src import orchestrator
+
+        receipts = self.root / "foundry" / "state" / "scout-receipts"
+        receipts.mkdir()
+        for number in range(31):
+            (receipts / f"{number:064x}.json").write_text("{}", encoding="utf-8")
+        claims = []
+        for name in ("first", "second"):
+            claim = self.root / "foundry" / "state" / f".{name}.claim"
+            claim.write_bytes(json.dumps(new_candidate(f"{name}-kit")).encode("utf-8"))
+            _, identity = orchestrator._read_regular_candidate_bytes(claim)
+            claims.append((claim, identity))
+
+        first_link_entered = threading.Event()
+        release_first_link = threading.Event()
+        link_lock = threading.Lock()
+        calls = 0
+        original_link = os.link
+        results: list[Path] = []
+        errors: list[BaseException] = []
+
+        def delayed_link(source, destination, *args, **kwargs):
+            nonlocal calls
+            with link_lock:
+                calls += 1
+                call_number = calls
+            if call_number == 1:
+                first_link_entered.set()
+                release_first_link.wait(timeout=3)
+            return original_link(source, destination, *args, **kwargs)
+
+        def reserve(claim, identity):
+            try:
+                results.append(orchestrator._create_scout_receipt(self.root, claim, identity))
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(orchestrator.os, "link", side_effect=delayed_link):
+            first = threading.Thread(target=reserve, args=claims[0])
+            second = threading.Thread(target=reserve, args=claims[1])
+            first.start()
+            self.assertTrue(first_link_entered.wait(timeout=3))
+            second.start()
+            # The vulnerable check-then-link code lets the second thread reach
+            # the link while the first still holds the last apparent slot.
+            time.sleep(0.15)
+            release_first_link.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], CandidateError)
+        self.assertEqual(len(list(receipts.glob("*.json"))), 32)
+
+    @POSIX_SNAPSHOT_REQUIRED
     def test_package_writes_verified_manifest_and_truthful_listing_without_publication(self):
         slug = "hermes-hybrid-operator-kit"
         source = self.root / "private-products" / slug
@@ -606,6 +803,52 @@ class OrchestratorTests(unittest.TestCase):
         with mock.patch.object(type(source), "__lt__", new=reverse_path_order):
             self.assertEqual(source_tree_revision(source), canonical)
 
+    def test_source_tree_revision_rejects_windows_style_reparse_root_directory_and_file(self):
+        """Direct identity helpers must not traverse a Windows junction either."""
+        source = self.root / "private-products" / "reparse-kit"
+        nested = source / "nested"
+        nested.mkdir(parents=True)
+        payload = nested / "README.md"
+        payload.write_text("safe bytes\n", encoding="utf-8")
+        from foundry.src import orchestrator
+
+        for marked in (source, nested, payload):
+            with self.subTest(marked=marked.relative_to(self.root).as_posix()):
+                with mock.patch.object(
+                    orchestrator,
+                    "_is_reparse_point",
+                    side_effect=lambda path, _details=None: Path(path).resolve() == marked.resolve(),
+                    create=True,
+                ):
+                    with self.assertRaisesRegex(ReleaseError, "link or reparse"):
+                        source_tree_revision(source)
+
+    @POSIX_SNAPSHOT_REQUIRED
+    def test_private_source_reparse_point_is_rejected_before_a_test_can_run(self):
+        slug = "hermes-hybrid-operator-kit"
+        sentinel = self.root / "reparse-source-test-ran"
+        source = self.write_packagable_product(
+            slug,
+            test_body=(
+                "from pathlib import Path\n"
+                f"Path({str(sentinel)!r}).write_text('ran', encoding='utf-8')\n"
+            ),
+        )
+        self.write_signals(accepted_signals())
+        gate_candidate(self.root, new_candidate(slug))
+        from foundry.src import orchestrator
+
+        with mock.patch.object(
+            orchestrator,
+            "_is_reparse_point",
+            side_effect=lambda path, _details=None: Path(path).resolve() == source.resolve(),
+            create=True,
+        ):
+            with self.assertRaisesRegex(ReleaseError, "reparse"):
+                package_release(self.root, slug, "1.0.0")
+        self.assertFalse(sentinel.exists())
+
+    @POSIX_SNAPSHOT_REQUIRED
     def test_package_audits_a_snapshot_before_a_symlinked_test_can_execute(self):
         slug = "hermes-hybrid-operator-kit"
         source = self.write_packagable_product(slug)
@@ -625,6 +868,28 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(sentinel.exists())
         self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
 
+    def test_unsupported_snapshot_host_fails_closed_before_private_source_execution(self):
+        """Windows compatibility runs never become an authority packager."""
+        slug = "hermes-hybrid-operator-kit"
+        sentinel = self.root / "unsupported-host-test-ran"
+        self.write_packagable_product(
+            slug,
+            test_body=(
+                "from pathlib import Path\n"
+                f"Path({str(sentinel)!r}).write_text('ran', encoding='utf-8')\n"
+            ),
+        )
+        self.write_signals(accepted_signals())
+        gate_candidate(self.root, new_candidate(slug))
+        from foundry.src import orchestrator
+
+        with mock.patch.object(orchestrator, "_supports_secure_snapshot_host", return_value=False, create=True):
+            with self.assertRaisesRegex(ReleaseError, "secure no-follow snapshot host"):
+                package_release(self.root, slug, "1.0.0")
+        self.assertFalse(sentinel.exists())
+        self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
+
+    @POSIX_SNAPSHOT_REQUIRED
     def test_package_rejects_linked_private_products_ancestry_before_execution(self):
         slug = "hermes-hybrid-operator-kit"
         source = self.write_packagable_product(slug)
@@ -643,6 +908,7 @@ class OrchestratorTests(unittest.TestCase):
             package_release(self.root, slug, "1.0.0")
         self.assertFalse(sentinel.exists())
 
+    @POSIX_SNAPSHOT_REQUIRED
     def test_snapshot_mutation_during_product_tests_fails_before_any_release_output(self):
         slug = "hermes-hybrid-operator-kit"
         test_body = (
@@ -656,6 +922,7 @@ class OrchestratorTests(unittest.TestCase):
             package_release(self.root, slug, "1.0.0")
         self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
 
+    @POSIX_SNAPSHOT_REQUIRED
     def test_release_rejects_a_build_race_instead_of_misbinding_source_revision_and_windows_claim(self):
         slug = "hermes-hybrid-operator-kit"
         source = self.write_packagable_product(slug)
@@ -681,6 +948,7 @@ class OrchestratorTests(unittest.TestCase):
                 package_release(self.root, slug, "1.0.0")
         self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
 
+    @POSIX_SNAPSHOT_REQUIRED
     def test_generated_release_and_listing_copy_are_claim_audited_before_output(self):
         cases = (
             ("best-seller", {"name": "Best-selling operator kit"}, "unsupported_bestseller"),
@@ -697,6 +965,7 @@ class OrchestratorTests(unittest.TestCase):
                     package_release(self.root, slug, "1.0.0")
                 self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
 
+    @POSIX_SNAPSHOT_REQUIRED
     def test_all_public_metadata_copy_fields_are_claim_audited_before_output(self):
         cases = (
             ("description-bestseller", {"description": "Best-selling operator kit."}, "unsupported_bestseller"),
@@ -713,6 +982,7 @@ class OrchestratorTests(unittest.TestCase):
                     package_release(self.root, slug, "1.0.0")
                 self.assertFalse((self.root / "dist" / "hermespacks" / f"{slug}-1.0.0.zip").exists())
 
+    @POSIX_SNAPSHOT_REQUIRED
     def test_stale_windows_platform_evidence_is_excluded_from_release_scope(self):
         slug = "hermes-hybrid-operator-kit"
         source = self.root / "private-products" / slug

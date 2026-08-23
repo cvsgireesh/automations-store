@@ -42,6 +42,7 @@ SCRIPT_NAMES = (
 )
 SKILL_NAME = "hermes-product-foundry"
 PROFILE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+WINDOWS_PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 INSTALLER_LOCK_FILE = ".foundry-install.lock"
 LOCK_TIMEOUT_SECONDS = 30.0
@@ -50,6 +51,16 @@ LOCK_RETRY_SECONDS = 0.05
 
 class ReconciliationError(RuntimeError):
     """A scheduler state is unsafe to reconcile automatically."""
+
+
+def _is_windows() -> bool:
+    """Keep platform checks mockable without replacing global ``os.name``."""
+    return os.name == "nt"
+
+
+def _is_profiles_component(name: str) -> bool:
+    """Recognize Windows' case-insensitive Profiles directory explicitly."""
+    return name == "profiles" or (_is_windows() and name.lower() == "profiles")
 
 
 @dataclass(frozen=True)
@@ -442,7 +453,7 @@ def plan_reconcile(existing: Sequence[Job | Mapping[str, Any]], desired: Sequenc
 
 def _home_ancestry(home: Path) -> tuple[Path, ...]:
     """Return the lexical Hermes-owned directories leading to ``home``."""
-    anchor = home.parent.parent if home.parent.name == "profiles" else home
+    anchor = home.parent.parent if _is_profiles_component(home.parent.name) else home
     paths = [anchor]
     current = anchor
     try:
@@ -511,7 +522,7 @@ def _safe_directory_chain(home: Path, destination_parent: Path) -> None:
     # A named profile lives below <root>/profiles/<name>.  Its .hermes root
     # and profiles directory are part of the destination ancestry too, so
     # validate them rather than only the final profile directory.
-    anchor = home_path.parent.parent if home_path.parent.name == "profiles" else home_path
+    anchor = home_path.parent.parent if _is_profiles_component(home_path.parent.name) else home_path
     relative = target.relative_to(anchor)
 
     # A named profile may be requested before its .hermes/profiles ancestry
@@ -547,6 +558,14 @@ def _safe_directory_chain(home: Path, destination_parent: Path) -> None:
             try:
                 current.mkdir()
                 details = current.lstat()
+            except FileExistsError:
+                # Another installer created this lexical component after our
+                # lstat.  Reinspect it below rather than treating a normal
+                # mkdir race as permission to follow an unchecked entry.
+                try:
+                    details = current.lstat()
+                except OSError as error:
+                    raise ReconciliationError(f"cannot inspect installed asset parent: {current}") from error
             except OSError as error:
                 raise ReconciliationError(f"cannot create installed asset parent: {current}") from error
         except OSError as error:
@@ -583,8 +602,48 @@ def _safe_lock_stat(lock_path: Path, *, missing_ok: bool = False) -> os.stat_res
     return details
 
 
-def _open_installer_lock(home: Path) -> tuple[Path, int]:
-    """Open one persistent safe lock inode without unlinking or replacing it."""
+def _safe_home_directory_stat(home: Path) -> os.stat_result:
+    """Validate the selected Hermes home without following a linked final path."""
+    try:
+        details = home.lstat()
+    except OSError as error:
+        raise ReconciliationError("planned Hermes home is unavailable for locking") from error
+    if home.is_symlink() or _is_reparse_point(home, details) or not stat.S_ISDIR(details.st_mode):
+        raise ReconciliationError("planned Hermes home is not a safe regular directory")
+    return details
+
+
+def _open_posix_home_lock(home: Path) -> int:
+    """Open the validated home directory inode used for POSIX serialization.
+
+    A child lock filename can be unlinked and recreated into a different inode.
+    Flocking the selected Hermes-home directory itself avoids that split while
+    every cooperating installer continues to target the same home path.
+    """
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
+    if not directory_flag or not no_follow_flag:
+        raise ReconciliationError("secure directory locking requires O_DIRECTORY and O_NOFOLLOW")
+    _safe_directory_chain(home, home)
+    before = _safe_home_directory_stat(home)
+    flags = os.O_RDONLY | directory_flag | no_follow_flag
+    try:
+        descriptor = os.open(home, flags)
+    except OSError as error:
+        raise ReconciliationError("cannot open planned Hermes home for locking") from error
+    try:
+        opened = os.fstat(descriptor)
+        after = _safe_home_directory_stat(home)
+        if not stat.S_ISDIR(opened.st_mode) or not _same_file(before, opened) or not _same_file(opened, after):
+            raise ReconciliationError("planned Hermes home changed while opening its lock")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_windows_installer_lock(home: Path) -> tuple[Path, int]:
+    """Open one persistent Windows lock inode without unlinking or replacing it."""
     _safe_directory_chain(home, home)
     lock_path = home / INSTALLER_LOCK_FILE
     before = _safe_lock_stat(lock_path, missing_ok=True)
@@ -636,6 +695,8 @@ def _wait_for_installer_lock(descriptor: int) -> None:
             msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
             return
         except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN) and getattr(error, "winerror", None) not in (32, 33):
+                raise ReconciliationError("cannot acquire Foundry installer lock") from error
             if time.monotonic() >= deadline:
                 raise ReconciliationError("timed out waiting for Foundry installer lock") from error
             time.sleep(LOCK_RETRY_SECONDS)
@@ -653,7 +714,24 @@ def _release_installer_lock(descriptor: int) -> None:
 @contextmanager
 def _installer_lock(home: Path) -> Iterator[None]:
     """Serialize read-plan-assets-CLI reconciliation for one Hermes home."""
-    lock_path, descriptor = _open_installer_lock(home)
+    if fcntl is not None:
+        descriptor = _open_posix_home_lock(home)
+        acquired = False
+        try:
+            _wait_for_installer_lock(descriptor)
+            acquired = True
+            # Revalidate after taking the directory lock.  A replacement of
+            # the whole chosen home is rejected before any scheduler work.
+            if not _same_file(os.fstat(descriptor), _safe_home_directory_stat(home)):
+                raise ReconciliationError("planned Hermes home changed while acquiring its lock")
+            yield
+        finally:
+            if acquired:
+                _release_installer_lock(descriptor)
+            os.close(descriptor)
+        return
+
+    lock_path, descriptor = _open_windows_installer_lock(home)
     acquired = False
     try:
         _wait_for_installer_lock(descriptor)
@@ -737,11 +815,12 @@ def install_assets(repo_root: str | Path, hermes_home: str | Path) -> None:
 
 def _profile_for_home(home: Path) -> str:
     """Pin the explicit profile that owns an already-planned Hermes home."""
-    if home.parent.name != "profiles":
+    if not _is_profiles_component(home.parent.name):
         return "default"
-    profile = home.name.casefold()
-    if not PROFILE_NAME.fullmatch(profile):
+    profile_pattern = WINDOWS_PROFILE_NAME if _is_windows() else PROFILE_NAME
+    if not profile_pattern.fullmatch(home.name):
         raise ReconciliationError(f"planned Hermes profile name is unsafe: {home.name}")
+    profile = home.name.lower() if _is_windows() else home.name
     try:
         profile_stat = home.lstat()
     except OSError as error:

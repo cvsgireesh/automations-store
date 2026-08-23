@@ -135,6 +135,7 @@ class AuditTreeTests(unittest.TestCase):
         codes = {finding.code for finding in audit_tree(self.root)}
         self.assertEqual(codes, {"sensitive_file", "symlink"})
 
+    @unittest.skipIf(sys.platform.startswith("win"), "Windows does not expose POSIX executable mode bits")
     def test_rejects_executable_binary(self):
         target = self.root / "tool"
         target.write_bytes(b"\x7fELF\x00binary")
@@ -239,6 +240,7 @@ class AuditTreeTests(unittest.TestCase):
         self.write("THIRD_PARTY_NOTICES.md", "No third-party code is included in this release.\n")
         self.assertEqual(audit_tree(self.root), [])
 
+    @unittest.skipUnless(KIT_ROOT.is_dir(), "ignored private kit is not part of this test canary")
     def test_does_not_flag_the_kit_shell_installer_as_a_testimonial(self):
         installer = KIT_ROOT / "scripts" / "install.sh"
         self.assertTrue(installer.is_file())
@@ -317,6 +319,7 @@ class AuditCliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(f"{link.as_posix()}: symlink\n", result.stdout)
 
+    @unittest.skipIf(sys.platform.startswith("win"), "Windows does not expose POSIX executable mode bits")
     def test_cli_individual_file_rejects_executable_binary(self):
         binary = self.root / "tool"
         binary.write_bytes(b"\x7fELF\x00binary")
@@ -325,6 +328,7 @@ class AuditCliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(f"{binary.as_posix()}: executable_binary\n", result.stdout)
 
+    @unittest.skipIf(sys.platform.startswith("win"), "Windows chmod does not deny the current process read access")
     def test_cli_individual_file_reports_unreadable_input(self):
         unreadable = self.root / "unreadable.txt"
         unreadable.write_text("plain text\n", encoding="utf-8")

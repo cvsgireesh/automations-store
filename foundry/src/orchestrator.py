@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta
+import errno
 import hashlib
 import json
 import os
@@ -21,11 +22,20 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time as clock
 from typing import Any, Iterator, Mapping, Sequence
 import uuid
 from zoneinfo import ZoneInfo
 
-import fcntl
+try:  # POSIX hosts use flock; Windows uses msvcrt byte locks below.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised by native Windows canary
+    fcntl = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - unavailable on POSIX hosts
+    import msvcrt
+except ImportError:  # pragma: no cover - exercised on POSIX hosts
+    msvcrt = None  # type: ignore[assignment]
 
 from .collector import collect
 from .audits import audit_text, audit_tree
@@ -41,6 +51,8 @@ SIGNALS_FILE = "latest-signals.json"
 COLLECTION_STATUS_FILE = "collection-status.json"
 CANDIDATE_FILE = "current-candidate.json"
 SCOUT_PROPOSAL_FILE = "scout-candidate.json"
+SCOUT_RECEIPTS_DIRECTORY = "scout-receipts"
+SCOUT_RECEIPT_LIMIT = 32
 PLATFORM_VERIFICATION_FILE = "platform-verification.json"
 GATE_FILE = "gate.json"
 LEDGER_FILE = "release-ledger.json"
@@ -56,6 +68,9 @@ NO_WINDOWS_LIVE_READINESS = "no Windows live Hermes readiness"
 # leaves those timestamps untouched, and candidates may use evidence at most
 # this many Chicago calendar days old.
 MAX_SIGNAL_AGE_DAYS = 14
+LOCK_TIMEOUT_SECONDS = 30.0
+LOCK_RETRY_SECONDS = 0.05
+SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 class FoundryError(RuntimeError):
@@ -119,19 +134,62 @@ def _observed_at(observed_date: str) -> str:
     return datetime.combine(date.fromisoformat(observed_date), time.min, tzinfo=CHICAGO).isoformat()
 
 
+def _lock_contention(error: OSError) -> bool:
+    """Recognize only ordinary advisory-lock contention across supported hosts."""
+    return error.errno in (errno.EACCES, errno.EAGAIN) or getattr(error, "winerror", None) in (32, 33)
+
+
+def _acquire_state_lock(descriptor: int) -> None:
+    """Take a bounded one-byte state lock through the host's native backend."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            return
+        except OSError as error:
+            raise FoundryError("cannot acquire Foundry state lock") from error
+    if msvcrt is None:  # pragma: no cover - every supported host has one backend
+        raise FoundryError("no supported Foundry state-lock backend")
+    deadline = clock.monotonic() + LOCK_TIMEOUT_SECONDS
+    while True:  # pragma: no cover - exercised by native Windows canary
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as error:
+            if not _lock_contention(error):
+                raise FoundryError("cannot acquire Foundry state lock") from error
+            if clock.monotonic() >= deadline:
+                raise FoundryError("timed out waiting for Foundry state lock") from error
+            clock.sleep(LOCK_RETRY_SECONDS)
+
+
+def _release_state_lock(descriptor: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:  # pragma: no cover - exercised by native Windows canary
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+
+
 @contextmanager
 def state_lock(repo_root: str | Path) -> Iterator[None]:
-    """Serialize mutable Foundry state using a POSIX advisory file lock."""
+    """Serialize mutable Foundry state with a native advisory one-byte lock."""
     root = _repo_root(repo_root)
     state_root = _state_root(root)
     state_root.mkdir(parents=True, exist_ok=True)
     lock_path = state_root / ".lock"
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    with lock_path.open("a+b") as lock_file:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+            os.fsync(lock_file.fileno())
+        _acquire_state_lock(lock_file.fileno())
         try:
             yield
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            _release_state_lock(lock_file.fileno())
 
 
 def _canonical_json(payload: Any) -> bytes:
@@ -275,19 +333,20 @@ def _signal_state_observed_date_unlocked(repo_root: Path) -> str | None:
         return None
 
 
-def _collection_is_stale_unlocked(repo_root: Path) -> bool:
-    """Return whether the last bounded collection failed or its marker is invalid.
+def _ready_signal_state_sha256_unlocked(repo_root: Path) -> str | None:
+    """Return the exact current ready signal digest, or ``None`` fail-closed.
 
-    Every success writes a ready marker bound to the exact signal-state bytes.
-    Missing, malformed, failed, or mismatched marker state leaves last-good
-    signals ineligible for a gate until a fresh collection completes.
+    The collection marker, its canonical date, and the raw persisted signals
+    bytes must agree.  A passed gate records this value, making a same-day
+    meaningful refresh invalidate the earlier decision even when citations
+    retain stable IDs.
     """
     try:
         status = _read_json(_state_root(repo_root) / COLLECTION_STATUS_FILE)
     except FoundryError:
-        return True
+        return None
     if not isinstance(status, Mapping) or status.get("status") != "ready":
-        return True
+        return None
     expected_digest = status.get("signals_sha256")
     observed_date = status.get("observed_date")
     try:
@@ -295,14 +354,21 @@ def _collection_is_stale_unlocked(repo_root: Path) -> bool:
     except ValueError:
         marker_date = None
     actual_digest = _signal_state_sha256_unlocked(repo_root)
-    return not (
+    if not (
         isinstance(expected_digest, str)
-        and len(expected_digest) == 64
+        and SHA256_HEX.fullmatch(expected_digest)
         and marker_date is not None
         and marker_date == _signal_state_observed_date_unlocked(repo_root)
         and actual_digest is not None
         and expected_digest == actual_digest
-    )
+    ):
+        return None
+    return actual_digest
+
+
+def _collection_is_stale_unlocked(repo_root: Path) -> bool:
+    """Return whether the last bounded collection has no valid ready marker."""
+    return _ready_signal_state_sha256_unlocked(repo_root) is None
 
 
 def latest_signals(repo_root: str | Path) -> list[Signal]:
@@ -578,13 +644,79 @@ def _claim_scout_proposal(proposal: Path) -> Path:
     return claimed
 
 
+def _scout_receipt_root(repo_root: Path) -> Path:
+    """Return the bounded ignored receipt quarantine without following links."""
+    receipts = _state_root(repo_root) / SCOUT_RECEIPTS_DIRECTORY
+    try:
+        details = receipts.lstat()
+    except FileNotFoundError:
+        try:
+            receipts.mkdir()
+            details = receipts.lstat()
+        except OSError as error:
+            raise CandidateError("Scout receipt quarantine could not be created") from error
+    except OSError as error:
+        raise CandidateError("Scout receipt quarantine could not be inspected") from error
+    if receipts.is_symlink() or not stat.S_ISDIR(details.st_mode):
+        raise CandidateError("Scout receipt quarantine must be a regular directory")
+    return receipts
+
+
+def _create_scout_receipt(repo_root: Path, claimed: Path, identity: ProposalIdentity) -> Path:
+    """Hard-link claimed bytes into bounded recovery before staging them.
+
+    Scout writers may only atomically replace the approved proposal pathname.
+    A successful consume preserves a durable receipt instead of destroying the
+    claimed inode; if a producer retains an open descriptor and writes later,
+    those bytes remain recoverable through this receipt.  Receipts are never
+    automatically removed; capacity exhaustion requires operator review.
+    """
+    # The capacity check and hard-link reservation must be one state-locked
+    # operation.  Independent Scout handoffs can otherwise both observe the
+    # final apparent slot and create an unbounded pair of durable receipts.
+    with state_lock(repo_root):
+        return _create_scout_receipt_unlocked(repo_root, claimed, identity)
+
+
+def _create_scout_receipt_unlocked(repo_root: Path, claimed: Path, identity: ProposalIdentity) -> Path:
+    """Reserve one receipt while the Foundry state lock is already held."""
+    receipts = _scout_receipt_root(repo_root)
+    try:
+        entries = list(receipts.iterdir())
+    except OSError as error:
+        raise CandidateError("Scout receipt quarantine could not be listed") from error
+    if len(entries) >= SCOUT_RECEIPT_LIMIT:
+        raise CandidateError("Scout receipt quarantine is full; operator recovery is required")
+    for entry in entries:
+        try:
+            entry_stat = entry.lstat()
+        except OSError as error:
+            raise CandidateError("Scout receipt quarantine contains an unreadable entry") from error
+        if entry.is_symlink() or not stat.S_ISREG(entry_stat.st_mode):
+            raise CandidateError("Scout receipt quarantine contains an unsafe entry")
+
+    for _ in range(8):
+        receipt = receipts / f"{identity[-1]}-{uuid.uuid4().hex}.json"
+        try:
+            os.link(claimed, receipt, follow_symlinks=False)
+        except FileExistsError:
+            continue
+        except (NotImplementedError, OSError) as error:
+            raise CandidateError("Scout receipt quarantine cannot safely retain this proposal") from error
+        if not _proposal_matches_identity(claimed, identity) or not _proposal_matches_identity(receipt, identity):
+            raise CandidateError("Scout proposal changed before durable receipt creation")
+        return receipt
+    raise CandidateError("Scout receipt quarantine could not reserve a durable receipt")
+
+
 def stage_candidate_file(repo_root: str | Path, candidate_path: str | Path, *, consume: bool = False) -> dict[str, Any]:
     """Stage a JSON candidate and consume only the one approved Scout proposal.
 
     ``--consume`` cannot remove an arbitrary path.  It is deliberately limited
     to the ignored ``foundry/state/scout-candidate.json`` handoff file, and it
-    removes that file only after the stage operation succeeds or is a safe
-    same-candidate no-op.
+    hard-links its claimed inode into a bounded ignored durable receipt before
+    a successful stage or safe same-candidate no-op.  Scout writers must never
+    write a claim or receipt path directly.
     """
     root = _repo_root(repo_root)
     proposal = _lexical_absolute(candidate_path)
@@ -597,10 +729,13 @@ def stage_candidate_file(repo_root: str | Path, candidate_path: str | Path, *, c
     claimed = _claim_scout_proposal(proposal)
     try:
         candidate, identity = _load_regular_candidate_file(claimed)
+        _create_scout_receipt(root, claimed, identity)
         result = stage_candidate(root, candidate)
         try:
             if not _proposal_matches_identity(claimed, identity):
                 raise CandidateError("Scout proposal changed before it could be consumed")
+            # The durable hard-linked receipt still names this inode, so this
+            # removes only the transient claim path, never held producer data.
             claimed.unlink()
         except FileNotFoundError as error:
             raise CandidateError("Scout proposal disappeared before it could be consumed") from error
@@ -775,7 +910,8 @@ def gate_candidate(repo_root: str | Path, payload: Mapping[str, Any], *,
     generated_date = _validated_date(as_of_date)
     with state_lock(root):
         signals = _latest_signals_unlocked(root)
-        collection_stale = _collection_is_stale_unlocked(root)
+        ready_signals_sha256 = _ready_signal_state_sha256_unlocked(root)
+        collection_stale = ready_signals_sha256 is None
         released_slugs = _released_slugs_unlocked(root)
         if _has_successful_candidate_unlocked(root, digest):
             passed, reasons, matched_ids = False, ["candidate_already_successfully_released"], []
@@ -797,6 +933,7 @@ def gate_candidate(repo_root: str | Path, payload: Mapping[str, Any], *,
             "passed": passed,
             "reasons": reasons,
             "collection_stale": collection_stale,
+            "signals_sha256": ready_signals_sha256,
             "stale_signal_ids": stale_signal_ids,
         }
         if passed:
@@ -857,6 +994,21 @@ def _read_public_metadata(repo_root: Path, slug: str, version: str) -> dict[str,
     return dict(metadata)
 
 
+def _is_reparse_point(path: Path | str, details: os.stat_result | None = None) -> bool:
+    """Recognize a Windows junction/reparse entry without following it."""
+    try:
+        entry = details if details is not None else Path(path).lstat()
+    except OSError:
+        return False
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(entry, "st_file_attributes", 0) & flag)
+
+
+def _is_link_or_reparse(path: Path | str, details: os.stat_result) -> bool:
+    """Treat symbolic links and Windows reparse points as equally unsafe."""
+    return stat.S_ISLNK(details.st_mode) or _is_reparse_point(path, details)
+
+
 def source_tree_revision(source: str | Path) -> str:
     """Return the release source identity, including ignored paid-source bytes.
 
@@ -864,14 +1016,25 @@ def source_tree_revision(source: str | Path) -> str:
     commit is never used as ``source_revision``.  The deterministic tree
     digest is the source identity that goes into the archive manifest.
     """
-    source_root = Path(source)
+    source_root = Path(os.path.abspath(os.fspath(Path(source).expanduser())))
     try:
         root_stat = source_root.lstat()
     except OSError as error:
         raise ReleaseError("source tree for revision hashing is unavailable") from error
-    if source_root.is_symlink() or not stat.S_ISDIR(root_stat.st_mode):
-        raise ReleaseError("source tree for revision hashing is unavailable")
-    source_root = source_root.resolve()
+    if _is_link_or_reparse(source_root, root_stat) or not stat.S_ISDIR(root_stat.st_mode):
+        raise ReleaseError("source tree contains a link or reparse root")
+    resolved_root = source_root.resolve()
+    try:
+        resolved_stat = resolved_root.lstat()
+    except OSError as error:
+        raise ReleaseError("source tree changed while being resolved") from error
+    if (
+        _is_link_or_reparse(resolved_root, resolved_stat)
+        or not stat.S_ISDIR(resolved_stat.st_mode)
+        or (root_stat.st_dev, root_stat.st_ino) != (resolved_stat.st_dev, resolved_stat.st_ino)
+    ):
+        raise ReleaseError("source tree changed or contains a link or reparse root")
+    source_root = resolved_root
 
     files: list[Path] = []
     for current, directories, filenames in os.walk(source_root, followlinks=False):
@@ -882,16 +1045,16 @@ def source_tree_revision(source: str | Path) -> str:
                 directory_stat = directory_path.lstat()
             except OSError as error:
                 raise ReleaseError("source tree changed while being hashed") from error
-            if directory_path.is_symlink() or not stat.S_ISDIR(directory_stat.st_mode):
-                raise ReleaseError("source tree contains a link or non-directory entry")
+            if _is_link_or_reparse(directory_path, directory_stat) or not stat.S_ISDIR(directory_stat.st_mode):
+                raise ReleaseError("source tree contains a link or reparse non-directory entry")
         for filename in filenames:
             file_path = current_path / filename
             try:
                 file_stat = file_path.lstat()
             except OSError as error:
                 raise ReleaseError("source tree changed while being hashed") from error
-            if file_path.is_symlink() or not stat.S_ISREG(file_stat.st_mode):
-                raise ReleaseError("source tree contains a link or non-regular file")
+            if _is_link_or_reparse(file_path, file_stat) or not stat.S_ISREG(file_stat.st_mode):
+                raise ReleaseError("source tree contains a link or reparse non-regular file")
             files.append(file_path)
 
     digest = hashlib.sha256()
@@ -932,9 +1095,25 @@ def _private_product_source(repo_root: Path, slug: str) -> Path:
             entry = path.lstat()
         except OSError as error:
             raise ReleaseError(f"{label} is unavailable") from error
-        if path.is_symlink() or not stat.S_ISDIR(entry.st_mode):
-            raise ReleaseError(f"{label} must be a regular directory, not a link")
+        if _is_link_or_reparse(path, entry) or not stat.S_ISDIR(entry.st_mode):
+            raise ReleaseError(f"{label} must be a regular directory, not a link or reparse point")
     return source
+
+
+def _supports_secure_snapshot_host() -> bool:
+    """Whether this host can enforce the FD-relative no-follow snapshot contract.
+
+    Authority packaging needs directory descriptors plus no-follow opens for
+    every source component.  Native Windows remains a supported compatibility
+    and monitoring target, but its Python file APIs do not offer that same
+    verified directory-FD contract.  Refuse packaging there instead of
+    silently falling back to path-based traversal.
+    """
+    return (
+        os.name == "posix"
+        and bool(getattr(os, "O_DIRECTORY", 0))
+        and bool(getattr(os, "O_NOFOLLOW", 0))
+    )
 
 
 def _snapshot_source_tree(source: Path, destination: Path) -> None:
@@ -953,14 +1132,14 @@ def _snapshot_source_tree(source: Path, destination: Path) -> None:
             raise ReleaseError("private product source contains a non-directory entry")
         return descriptor
 
-    def copy_regular_file(name: str, source_fd: int, target: Path) -> None:
+    def copy_regular_file(name: str, source_fd: int, target: Path, source_path: Path) -> None:
         try:
             descriptor = os.open(name, flags, dir_fd=source_fd)
         except OSError as error:
             raise ReleaseError("private product source contains an unreadable or linked file") from error
         try:
             opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode):
+            if _is_link_or_reparse(source_path, opened) or not stat.S_ISREG(opened.st_mode):
                 raise ReleaseError("private product source contains a non-regular file")
             with os.fdopen(descriptor, "rb", closefd=True) as source_file:
                 descriptor = -1
@@ -971,7 +1150,7 @@ def _snapshot_source_tree(source: Path, destination: Path) -> None:
             if descriptor >= 0:
                 os.close(descriptor)
 
-    def copy_directory(source_fd: int, target: Path) -> None:
+    def copy_directory(source_fd: int, target: Path, source_path: Path) -> None:
         try:
             entries = sorted(list(os.scandir(source_fd)), key=lambda entry: entry.name)
             for entry in entries:
@@ -979,18 +1158,19 @@ def _snapshot_source_tree(source: Path, destination: Path) -> None:
                     entry_stat = os.stat(entry.name, dir_fd=source_fd, follow_symlinks=False)
                 except OSError as error:
                     raise ReleaseError("private product source changed while snapshotting") from error
-                if stat.S_ISLNK(entry_stat.st_mode):
-                    raise ReleaseError("private product source contains a symlink")
+                entry_path = source_path / entry.name
+                if _is_link_or_reparse(entry_path, entry_stat):
+                    raise ReleaseError("private product source contains a symlink or reparse point")
                 if stat.S_ISDIR(entry_stat.st_mode):
                     child_target = target / entry.name
                     child_target.mkdir()
                     child_fd = open_directory(entry.name, directory_fd=source_fd)
                     try:
-                        copy_directory(child_fd, child_target)
+                        copy_directory(child_fd, child_target, entry_path)
                     finally:
                         os.close(child_fd)
                 elif stat.S_ISREG(entry_stat.st_mode):
-                    copy_regular_file(entry.name, source_fd, target / entry.name)
+                    copy_regular_file(entry.name, source_fd, target / entry.name, entry_path)
                 else:
                     raise ReleaseError("private product source contains a non-regular file")
         except OSError as error:
@@ -1000,25 +1180,43 @@ def _snapshot_source_tree(source: Path, destination: Path) -> None:
         source_stat = source.lstat()
     except OSError as error:
         raise ReleaseError("private product source is unavailable") from error
-    if source.is_symlink() or not stat.S_ISDIR(source_stat.st_mode):
+    if _is_link_or_reparse(source, source_stat) or not stat.S_ISDIR(source_stat.st_mode):
         raise ReleaseError("private product source is unavailable")
     destination.mkdir(parents=True)
     source_fd = open_directory(source)
     try:
-        copy_directory(source_fd, destination)
+        copy_directory(source_fd, destination, source)
     finally:
         os.close(source_fd)
 
 
 def _snapshot_file_hashes(source: Path) -> dict[str, str]:
     """Return release-member file hashes for a previously safe snapshot."""
+    try:
+        root_stat = source.lstat()
+    except OSError as error:
+        raise ReleaseError("snapshot is unavailable") from error
+    if _is_link_or_reparse(source, root_stat) or not stat.S_ISDIR(root_stat.st_mode):
+        raise ReleaseError("snapshot contains a linked or invalid root")
     root = source.resolve()
     hashes: dict[str, str] = {}
-    for current, _, filenames in os.walk(root, followlinks=False):
+    for current, directories, filenames in os.walk(root, followlinks=False):
         current_path = Path(current)
+        for directory in directories:
+            path = current_path / directory
+            try:
+                details = path.lstat()
+            except OSError as error:
+                raise ReleaseError("snapshot changed while being hashed") from error
+            if _is_link_or_reparse(path, details) or not stat.S_ISDIR(details.st_mode):
+                raise ReleaseError("snapshot contains a linked or invalid directory")
         for filename in filenames:
             path = current_path / filename
-            if path.is_symlink() or not path.is_file():
+            try:
+                details = path.lstat()
+            except OSError as error:
+                raise ReleaseError("snapshot changed while being hashed") from error
+            if _is_link_or_reparse(path, details) or not stat.S_ISREG(details.st_mode):
                 raise ReleaseError("snapshot contains a linked or invalid file")
             hashes[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
     return dict(sorted(hashes.items()))
@@ -1104,7 +1302,8 @@ def _release_metadata(repo_root: Path, snapshot_root: Path, source: Path,
 
 
 def _fresh_gate_unlocked(repo_root: Path, slug: str) -> dict[str, Any]:
-    if _collection_is_stale_unlocked(repo_root):
+    ready_signals_sha256 = _ready_signal_state_sha256_unlocked(repo_root)
+    if ready_signals_sha256 is None:
         raise ReleaseError("latest collection evidence is stale or unverifiable")
     gate = _read_json(_state_root(repo_root) / GATE_FILE)
     if not isinstance(gate, Mapping) or gate.get("passed") is not True:
@@ -1119,6 +1318,9 @@ def _fresh_gate_unlocked(repo_root: Path, slug: str) -> dict[str, Any]:
         raise ReleaseError("gate.json is for a different product")
     if candidate_sha256(candidate) != digest:
         raise ReleaseError("gate.json candidate hash does not match its contents")
+    gate_signals_sha256 = gate.get("signals_sha256")
+    if not isinstance(gate_signals_sha256, str) or gate_signals_sha256 != ready_signals_sha256:
+        raise ReleaseError("gate.json signal evidence no longer matches the current ready collection")
     return dict(gate)
 
 
@@ -1157,6 +1359,8 @@ def package_release(repo_root: str | Path, slug: str, version: str) -> dict[str,
             return {"status": "noop"}
         if _has_successful_slug_version_unlocked(root, slug, version):
             raise ReleaseError("a different candidate already owns this successful slug/version")
+        if not _supports_secure_snapshot_host():
+            raise ReleaseError("authority packaging requires a secure no-follow snapshot host")
 
         public_metadata = _read_public_metadata(root, slug, version)
         _audit_generated_copy({"public-product-metadata.json": public_metadata})

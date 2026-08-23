@@ -17,6 +17,7 @@ import time
 import unittest
 from unittest import mock
 
+from foundry import install_jobs
 from foundry.install_jobs import (
     ReconciliationError,
     desired_jobs,
@@ -148,6 +149,7 @@ class InstallerPlanningTests(unittest.TestCase):
         self.assertEqual(builder.prompt, (ROOT / "foundry" / "prompts" / "BUILDER.md").read_text(encoding="utf-8").rstrip())
         for phrase in (
             "scout-candidate.json",
+            "scout-receipts",
             "(cd .. && python3 -m foundry.src.orchestrator stage-candidate --candidate foundry/state/scout-candidate.json --consume)",
             "at most one",
             "Never build",
@@ -339,6 +341,21 @@ class InstallerExecutionTests(unittest.TestCase):
             self.assertEqual(calls[0][0][:4], ["hermes", "-p", "foundry", "cron"])
             self.assertEqual(calls[0][1]["HERMES_HOME"], str(hermes_home))
 
+    def test_windows_mixed_case_profiles_component_pins_the_named_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hermes_home = Path(directory) / ".hermes" / "Profiles" / "Foundry"
+            hermes_home.mkdir(parents=True)
+            calls: list[tuple[list[str], dict[str, str]]] = []
+
+            with mock.patch.object(install_jobs, "_is_windows", return_value=True, create=True):
+                run_installer(
+                    ROOT,
+                    hermes_home=hermes_home,
+                    runner=lambda command, environment: calls.append((command, environment)),
+                )
+            self.assertEqual(calls[0][0][:4], ["hermes", "-p", "foundry", "cron"])
+            self.assertEqual(calls[0][1]["HERMES_HOME"], str(hermes_home))
+
     def test_update_and_resume_mutations_also_receive_the_pinned_home_and_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             hermes_home = Path(directory) / ".hermes"
@@ -395,7 +412,7 @@ class InstallerExecutionTests(unittest.TestCase):
             self.assertFalse((hermes_home / "scripts").exists())
             self.assertFalse((hermes_home / "skills").exists())
 
-    def test_real_installer_rejects_a_linked_reconciliation_lock_before_mutation(self):
+    def test_platform_lock_never_follows_a_linked_lock_path(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             hermes_home = base / ".hermes"
@@ -404,15 +421,28 @@ class InstallerExecutionTests(unittest.TestCase):
             outside.mkdir()
             (hermes_home / ".foundry-install.lock").symlink_to(outside, target_is_directory=True)
             commands: list[list[str]] = []
-            with self.assertRaisesRegex(ReconciliationError, "lock"):
-                run_installer(
+            if install_jobs.fcntl is not None:
+                # POSIX locks the validated Hermes-home directory itself, so
+                # this unrelated filename is neither followed nor trusted.
+                actions = run_installer(
                     ROOT,
                     hermes_home=hermes_home,
                     runner=lambda command, environment: commands.append(command),
                 )
-            self.assertEqual(commands, [])
-            self.assertFalse((hermes_home / "scripts").exists())
-            self.assertFalse((hermes_home / "skills").exists())
+                self.assertEqual([action.kind for action in actions], ["create"] * 4)
+                self.assertEqual(len(commands), 4)
+            else:
+                # Windows holds the persistent regular lock file with msvcrt.
+                with self.assertRaisesRegex(ReconciliationError, "lock"):
+                    run_installer(
+                        ROOT,
+                        hermes_home=hermes_home,
+                        runner=lambda command, environment: commands.append(command),
+                    )
+                self.assertEqual(commands, [])
+                self.assertTrue(hermes_home.is_dir())
+                self.assertFalse((hermes_home / "scripts").exists())
+                self.assertFalse((hermes_home / "skills").exists())
 
     def test_concurrent_real_installers_serialize_planning_and_create_each_managed_name_once(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -468,9 +498,128 @@ class InstallerExecutionTests(unittest.TestCase):
             self.assertEqual(commands, list(desired_by_name))
             self.assertEqual(sorted(len(actions) for actions in results), [0, 4])
             lock_path = hermes_home / ".foundry-install.lock"
-            self.assertTrue(lock_path.is_file())
-            self.assertFalse(lock_path.is_symlink())
-            self.assertEqual(lock_path.stat().st_nlink, 1)
+            if install_jobs.fcntl is None:
+                self.assertTrue(lock_path.is_file())
+                self.assertFalse(lock_path.is_symlink())
+                self.assertEqual(lock_path.stat().st_nlink, 1)
+            else:
+                self.assertFalse(lock_path.exists())
+
+    @unittest.skipIf(install_jobs.fcntl is None, "POSIX directory-lock regression")
+    def test_posix_home_lock_survives_lock_path_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hermes_home = Path(directory) / ".hermes"
+            jobs_path = hermes_home / "cron" / "jobs.json"
+            desired_by_name = {job.name: job for job in desired_jobs(ROOT)}
+            first_command = threading.Event()
+            allow_first_command = threading.Event()
+            write_lock = threading.Lock()
+            commands: list[str] = []
+            results: list[list] = []
+            errors: list[BaseException] = []
+
+            def runner(command, environment):
+                name = command[command.index("--name") + 1]
+                with write_lock:
+                    is_first = not commands
+                    commands.append(name)
+                    if is_first:
+                        first_command.set()
+                if is_first:
+                    if not allow_first_command.wait(timeout=3):
+                        raise RuntimeError("test did not release the first installer")
+                with write_lock:
+                    records = []
+                    if jobs_path.exists():
+                        records = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+                    records.append(persisted(desired_by_name[name], f"job-{len(records)}"))
+                    jobs_path.parent.mkdir(parents=True, exist_ok=True)
+                    jobs_path.write_text(json.dumps({"jobs": records}), encoding="utf-8")
+
+            def invoke():
+                try:
+                    results.append(run_installer(ROOT, hermes_home=hermes_home, runner=runner))
+                except BaseException as error:
+                    errors.append(error)
+
+            first = threading.Thread(target=invoke)
+            second = threading.Thread(target=invoke)
+            first.start()
+            self.assertTrue(first_command.wait(timeout=3))
+            # The old lock-file design lets this replacement create a second
+            # lock inode.  A home-directory flock must remain authoritative.
+            lock_path = hermes_home / ".foundry-install.lock"
+            lock_path.unlink(missing_ok=True)
+            lock_path.write_text("replacement", encoding="utf-8")
+            second.start()
+            try:
+                time.sleep(0.15)
+                self.assertEqual(commands, ["Product Foundry Signal Collector"])
+            finally:
+                allow_first_command.set()
+                first.join(timeout=5)
+                second.join(timeout=5)
+            self.assertFalse(first.is_alive() or second.is_alive())
+            self.assertEqual(errors, [])
+            names = [record["name"] for record in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]]
+            self.assertEqual(names, list(desired_by_name))
+            self.assertEqual(commands, list(desired_by_name))
+            self.assertEqual(sorted(len(actions) for actions in results), [0, 4])
+
+    @unittest.skipIf(install_jobs.fcntl is None, "POSIX directory-lock regression")
+    def test_posix_home_lock_fails_closed_without_no_follow_directory_primitives(self):
+        for attribute in ("O_DIRECTORY", "O_NOFOLLOW"):
+            with self.subTest(attribute=attribute), tempfile.TemporaryDirectory() as directory:
+                hermes_home = Path(directory) / ".hermes"
+                commands: list[list[str]] = []
+                with mock.patch.object(install_jobs.os, attribute, 0, create=True):
+                    with self.assertRaisesRegex(ReconciliationError, "secure directory locking"):
+                        run_installer(
+                            ROOT,
+                            hermes_home=hermes_home,
+                            runner=lambda command, environment: commands.append(command),
+                        )
+                self.assertEqual(commands, [])
+                self.assertFalse((hermes_home / "scripts").exists())
+                self.assertFalse((hermes_home / "skills").exists())
+
+    def test_concurrent_missing_home_creation_revalidates_the_loser_after_file_exists(self):
+        """A normal mkdir race is not a symlink/reparse failure."""
+        with tempfile.TemporaryDirectory() as directory:
+            hermes_home = Path(directory) / ".hermes"
+            barrier = threading.Barrier(2)
+            original_mkdir = Path.mkdir
+            results: list[list] = []
+            errors: list[BaseException] = []
+
+            def racing_mkdir(path, *args, **kwargs):
+                if Path(path) == hermes_home:
+                    barrier.wait(timeout=3)
+                return original_mkdir(path, *args, **kwargs)
+
+            def invoke():
+                try:
+                    results.append(
+                        run_installer(
+                            ROOT,
+                            hermes_home=hermes_home,
+                            runner=lambda command, environment: None,
+                        )
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            with mock.patch.object(Path, "mkdir", new=racing_mkdir):
+                first = threading.Thread(target=invoke)
+                second = threading.Thread(target=invoke)
+                first.start()
+                second.start()
+                first.join(timeout=5)
+                second.join(timeout=5)
+            self.assertFalse(first.is_alive() or second.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(sorted(len(actions) for actions in results), [4, 4])
+            self.assertTrue(hermes_home.is_dir())
 
     def test_asset_install_rejects_symlinked_parent_and_destination(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -527,7 +676,13 @@ class InstallerExecutionTests(unittest.TestCase):
             destination.write_bytes((ROOT / "foundry" / "scripts" / "product_foundry_collect.py").read_bytes())
             destination.chmod(0o600)
             install_assets(ROOT, hermes_home)
-            self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+            if sys.platform.startswith("win"):
+                # Windows does not expose executable mode bits through chmod;
+                # verify the copied wrapper remains writable and present.
+                self.assertTrue(destination.is_file())
+                self.assertTrue(destination.stat().st_mode & 0o200)
+            else:
+                self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
 
         with tempfile.TemporaryDirectory() as directory:
             hermes_home = Path(directory) / ".hermes"
