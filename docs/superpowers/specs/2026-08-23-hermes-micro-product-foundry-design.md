@@ -1,6 +1,6 @@
 # Hermes Micro-Product Foundry — Design
 
-Date: 2026-08-23  
+Date: 2026-08-23
 Status: approved in advance by the owner ("no questions", "all permissions granted")
 
 ## Objective
