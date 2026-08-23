@@ -1,13 +1,14 @@
 {
   "allowed_hosts": [
     "gumroad.com",
+    "moelueker.gumroad.com",
     "api.github.com",
     "github.com",
     "pypistats.org"
   ],
   "sources": [
     {
-      "url": "https://gumroad.com/l/hermes-workflow-playbook",
+      "url": "https://moelueker.gumroad.com/l/hermes-agent-playbook",
       "source_type": "paid_comparable",
       "parser": "gumroad_product",
       "fixture": "gumroad-product.html",
