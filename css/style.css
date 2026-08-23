@@ -58,6 +58,7 @@ p { margin: 0 0 1rem; }
 .prose section { padding: 1.5rem 0; border-bottom: 1px solid var(--line); }
 .prose section:last-child { border-bottom: 0; }
 .prose h1 { margin-bottom: 2rem; }
+.release-hash { overflow-wrap: anywhere; padding: .75rem; border: 1px solid var(--line); border-radius: .5rem; background: var(--soft); }
 .site-footer { border-top: 1px solid var(--line); color: var(--muted); font-size: .9rem; }
 .site-footer p { margin: 0; }
 @media (max-width: 680px) {

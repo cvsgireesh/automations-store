@@ -1,13 +1,13 @@
 # HermesPacks storefront
 
-This is a dependency-free static storefront for one pre-release product: the Hermes Hybrid Operator Kit.
+This is a dependency-free static storefront for one verified, pre-publication product: the Hermes Hybrid Operator Kit.
 
 ## Current state
 
 - Launch price: $12
 - Checkout: pending; no purchase link is published
-- Updates: a 30-day update window begins with the first packaged release
-- Verification: `proof.html` records the current pending test scope and will publish the archive hash with the first packaged release
+- Updates: the current correction window ends on September 22, 2026
+- Verification: `proof.html` records the archive hash and exact canary limits; the public verification JSON lives under `products/`
 
 ## Product scope
 

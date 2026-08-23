@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "slug": "hermes-hybrid-operator-kit",
+  "version": "1.0.0",
+  "verified_date": "2026-08-23",
+  "archive_filename": "hermes-hybrid-operator-kit-1.0.0.zip",
+  "archive_sha256": "3a95365c355aebbb4f83af93d3a64c25004a4e0123324249418a3bd0b8848a3c",
+  "source_revision": "tree-sha256:9bac0a3ae2bc9152962938c9d9592b8d6732e4036706f76cb1cfa7581010d2b5",
+  "build_control_revision": "66afd5902ce1e8bc4931a9309b044b3cd238da84",
+  "candidate_sha256": "cbe481ee5b9820592da9ab9aa71eef6c3a6d4bc973dd899a762fef9d4e72ce5a",
+  "test_command": "python3 -B private-products/hermes-hybrid-operator-kit/tests/test_kit.py -v",
+  "test_output_sha256": "90bd86cbf1901bd733230b055a16c15f15d31407f096e36e7cf36c7219027129",
+  "tested_platforms": [
+    "Mac product suite",
+    "Windows native compatibility canary (no Windows live Hermes readiness)"
+  ],
+  "tested_scope": "Mac product suite; Windows native compatibility canary; no Windows live Hermes readiness.",
+  "update_policy_end_date": "2026-09-22",
+  "price_usd": 12,
+  "checkout_status": "pending_payout_onboarding",
+  "publication_status": "not_published",
+  "verified_revenue_usd": 0
+}

@@ -7,7 +7,13 @@
   "publication_status": "not_published",
   "verified_revenue_usd": 0,
   "update_policy": "Current release plus 30 days of corrections.",
+  "update_policy_end_date": "2026-09-22",
   "description": "A bounded kit for reviewed routing fragments, redacted preflight checks, staged installers, checklists, and failure drills.",
-  "verification_status": "pending_release_verification",
+  "verification_status": "verified_release_manifest",
+  "verification_manifest": "products/hermes-hybrid-operator-kit-1.0.0-verification.json",
+  "archive_sha256": "3a95365c355aebbb4f83af93d3a64c25004a4e0123324249418a3bd0b8848a3c",
+  "source_revision": "tree-sha256:9bac0a3ae2bc9152962938c9d9592b8d6732e4036706f76cb1cfa7581010d2b5",
+  "verified_date": "2026-08-23",
+  "tested_scope": "Mac product suite; Windows native compatibility canary; no Windows live Hermes readiness.",
   "non_affiliation": "Independent product with no relationship to Nous Research or OpenAI."
 }

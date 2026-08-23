@@ -27,6 +27,14 @@ def product_metadata() -> dict:
     )
 
 
+def verification_metadata() -> dict:
+    return json.loads(
+        (ROOT / "products" / "hermes-hybrid-operator-kit-1.0.0-verification.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
 NODE_RUNNER = r"""
 const fs = require('fs');
 const vm = require('vm');
@@ -115,6 +123,7 @@ class StorefrontTests(unittest.TestCase):
         ):
             self.assertIn(inclusion, page)
         self.assertIn("fresh canaries", page)
+        self.assertIn("Verified release", page)
         for phrase in FORBIDDEN:
             self.assertNotIn(phrase, page)
 
@@ -191,8 +200,10 @@ class StorefrontTests(unittest.TestCase):
         self.assertIn("Checkout is not open yet.", order)
         self.assertEqual(metadata["update_policy"], "Current release plus 30 days of corrections.")
         self.assertIn(metadata["update_policy"], index)
-        self.assertEqual(metadata["verification_status"], "pending_release_verification")
-        self.assertIn("No release manifest is published yet.", proof)
+        self.assertEqual(metadata["verification_status"], "verified_release_manifest")
+        self.assertIn(metadata["archive_sha256"], proof)
+        self.assertIn(metadata["verification_manifest"], proof)
+        self.assertIn(metadata["update_policy_end_date"], proof)
         self.assertIn(metadata["non_affiliation"], index)
         self.assertIn(metadata["non_affiliation"], order)
         self.assertIn(metadata["non_affiliation"], proof)
@@ -221,7 +232,21 @@ class StorefrontTests(unittest.TestCase):
         proof = proof_path.read_text(encoding="utf-8")
         self.assertIn("Verified hashes", proof)
         self.assertIn("Tested scope", proof)
-        self.assertIn("archive hash will appear after the first packaged release", proof)
+        self.assertIn("3a95365c355aebbb4f83af93d3a64c25004a4e0123324249418a3bd0b8848a3c", proof)
+        self.assertIn("Windows live Hermes readiness was not established", proof)
+
+    def test_public_verification_artifact_matches_metadata_and_proof(self):
+        product = product_metadata()
+        verification = verification_metadata()
+        proof = read("proof.html")
+        self.assertEqual(verification["slug"], product["slug"])
+        self.assertEqual(verification["version"], product["version"])
+        self.assertEqual(verification["archive_sha256"], product["archive_sha256"])
+        self.assertEqual(verification["source_revision"], product["source_revision"])
+        self.assertEqual(verification["update_policy_end_date"], product["update_policy_end_date"])
+        self.assertEqual(verification["verified_revenue_usd"], 0)
+        self.assertEqual(verification["publication_status"], "not_published")
+        self.assertIn(verification["archive_sha256"], proof)
 
 
 if __name__ == "__main__":
