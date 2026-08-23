@@ -44,6 +44,30 @@ class AuditTextTests(unittest.TestCase):
         findings = audit_text("Save 20% today.", "sales.html")
         self.assertIn("unsupported_discount_claim", {finding.code for finding in findings})
 
+    def test_rejects_urgency_and_scarcity_copy(self):
+        findings = audit_text("Limited-time offer — buy now before midnight!", "sales.html")
+        self.assertIn("unsupported_urgency_scarcity", {finding.code for finding in findings})
+
+    def test_rejects_markdown_html_and_css_crossed_out_pricing(self):
+        examples = (
+            "~~$29~~ $12",
+            "<del>$29</del> $12",
+            ".original-price { text-decoration: line-through; }",
+            '<span style="text-decoration: line-through">$29</span> $12',
+        )
+        for example in examples:
+            with self.subTest(example=example):
+                findings = audit_text(example, "sales.html")
+                self.assertIn("unsupported_discount_claim", {finding.code for finding in findings})
+
+    def test_rejects_trusted_by_numeric_developer_counts(self):
+        findings = audit_text("Trusted by 1,000 developers.", "sales.html")
+        self.assertIn("unsupported_social_proof", {finding.code for finding in findings})
+
+    def test_rejects_attributed_quoted_testimonials(self):
+        findings = audit_text('“This is excellent.” — Jane Doe, Acme Corp', "sales.html")
+        self.assertIn("unsupported_testimonial", {finding.code for finding in findings})
+
     def test_rejects_numeric_performance_and_cost_benchmarks(self):
         findings = audit_text("Processes jobs 2x faster for $0.01 per task.", "sales.html")
         self.assertIn("unsupported_benchmark", {finding.code for finding in findings})
@@ -104,7 +128,7 @@ class AuditTreeTests(unittest.TestCase):
         self.write("third_party/library/module.py", "print('library')")
         self.write(
             "THIRD_PARTY_NOTICES.md",
-            "## other-library\n- Source URL: https://example.com/other\n- License: MIT\n",
+            "## third_party/other-library\n- Source URL: https://example.com/other\n- License: MIT\n",
         )
         codes = {finding.code for finding in audit_tree(self.root)}
         self.assertEqual(codes, {"missing_third_party_component_notice", "unmatched_third_party_notice"})
@@ -113,7 +137,7 @@ class AuditTreeTests(unittest.TestCase):
         self.write("vendor/library/module.py", "print('library')")
         self.write(
             "THIRD_PARTY_NOTICES.md",
-            "## library\n- Source URL: https://example.com/library\n- License: GPL-3.0\n",
+            "## vendor/library\n- Source URL: https://example.com/library\n- License: GPL-3.0\n",
         )
         self.assertIn("incompatible_third_party_license", {finding.code for finding in audit_tree(self.root)})
 
@@ -121,8 +145,8 @@ class AuditTreeTests(unittest.TestCase):
         self.write("vendor/library/module.py", "print('library')")
         self.write(
             "THIRD_PARTY_NOTICES.md",
-            "## library\n- Source URL: https://example.com/library\n- License: MIT\n\n"
-            "## library\n- Source URL: https://mirror.example.com/library\n- License: MIT\n",
+            "## vendor/library\n- Source URL: https://example.com/library\n- License: MIT\n\n"
+            "## vendor/library\n- Source URL: https://mirror.example.com/library\n- License: MIT\n",
         )
         self.assertIn("duplicate_third_party_notice", {finding.code for finding in audit_tree(self.root)})
 
@@ -131,10 +155,48 @@ class AuditTreeTests(unittest.TestCase):
         self.write("vendor/utility/module.py", "print('utility')")
         self.write(
             "THIRD_PARTY_NOTICES.md",
-            "## library\n- Source URL: https://example.com/library\n- License: MIT\n\n"
-            "## utility\n- Source URL: https://example.com/utility\n- License: Apache-2.0\n",
+            "## third_party/library\n- Source URL: https://example.com/library\n- License: MIT\n\n"
+            "## vendor/utility\n- Source URL: https://example.com/utility\n- License: Apache-2.0\n",
         )
         self.assertEqual(audit_tree(self.root), [])
+
+    def test_discovers_all_supported_third_party_directory_names_recursively(self):
+        self.write("third_party/core/module.py", "print('core')")
+        self.write("src/vendor/gpl_lib/module.py", "print('gpl')")
+        self.write("plugins/third-party/alpha/module.py", "print('alpha')")
+        self.write("extensions/thirdparty/beta/module.py", "print('beta')")
+        self.write(
+            "THIRD_PARTY_NOTICES.md",
+            "## third_party/core\n- Source URL: https://example.com/core\n- License: GPL-3.0\n\n"
+            "## src/vendor/gpl_lib\n- Source URL: https://example.com/gpl\n- License: GPL-3.0\n\n"
+            "## plugins/third-party/alpha\n- Source URL: https://example.com/alpha\n- License: GPL-3.0\n\n"
+            "## extensions/thirdparty/beta\n- Source URL: https://example.com/beta\n- License: GPL-3.0\n",
+        )
+        findings = audit_tree(self.root)
+        self.assertEqual(
+            {finding.path for finding in findings if finding.code == "incompatible_third_party_license"},
+            {"third_party/core", "src/vendor/gpl_lib", "plugins/third-party/alpha", "extensions/thirdparty/beta"},
+        )
+
+    def test_rejects_incompatible_license_in_nested_vendor_directory(self):
+        self.write("src/vendor/gpl_lib/module.py", "print('gpl')")
+        self.write(
+            "THIRD_PARTY_NOTICES.md",
+            "## src/vendor/gpl_lib\n- Source URL: https://example.com/gpl\n- License: GPL-3.0\n",
+        )
+        self.assertIn("incompatible_third_party_license", {finding.code for finding in audit_tree(self.root)})
+
+    def test_validates_present_root_notice_without_detected_components(self):
+        self.write(
+            "THIRD_PARTY_NOTICES.md",
+            "## src/vendor/gpl_lib\n- Source URL: https://example.com/gpl\n- License: GPL-3.0\n",
+        )
+        codes = {finding.code for finding in audit_tree(self.root)}
+        self.assertEqual(codes, {"unmatched_third_party_notice", "incompatible_third_party_license"})
+
+    def test_rejects_malformed_no_component_notice(self):
+        self.write("THIRD_PARTY_NOTICES.md", "No vendor directories are present.\n")
+        self.assertIn("invalid_third_party_notices", {finding.code for finding in audit_tree(self.root)})
 
     def test_accepts_explicit_no_third_party_code_notice_when_vendor_directories_are_absent(self):
         self.write("THIRD_PARTY_NOTICES.md", "No third-party code is included in this release.\n")

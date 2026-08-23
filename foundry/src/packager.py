@@ -130,7 +130,7 @@ def build_release(source: str | Path, output_zip: str | Path,
     source_files = _source_files(source_root)
     source_names = {name for name, _ in source_files}
     manifest_name = "RELEASE-MANIFEST.json"
-    if manifest_name in source_names:
+    if any(name.casefold() == manifest_name.casefold() for name in source_names):
         raise PackagingError("source must not contain the reserved RELEASE-MANIFEST.json")
     if not launchers.issubset(source_names):
         raise PackagingError("declared launcher is not a source file")

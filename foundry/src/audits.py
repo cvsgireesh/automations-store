@@ -9,13 +9,19 @@ import re
 
 
 FORBIDDEN_CLAIMS = {
-    "unsupported_social_proof": re.compile(r"\b(?:hundreds|thousands) of (?:developers|customers|users)\b", re.I),
+    "unsupported_social_proof": re.compile(
+        r"\b(?:hundreds|thousands) of (?:developers|customers|users)\b"
+        r"|\btrusted\s+by\s+\d[\d,]*(?:\.\d+)?\+?\s+(?:developers?|customers?|users?|buyers?)\b",
+        re.I,
+    ),
     "unsupported_bestseller": re.compile(r"\bbest[ -]?seller\b", re.I),
     "unsupported_lifetime": re.compile(r"\blifetime updates?\b", re.I),
     "unsupported_testimonial": re.compile(
         r"\b(?:a\s+)?(?:buyer|customer|user)\s+(?:says|said|writes|wrote|reports|reported)\b"
         r"|<(?:testimonial|review)\b"
-        r"|(?:class|id|data-[\w-]+)\s*=\s*['\"][^'\"]*\b(?:testimonial|review)s?\b",
+        r"|(?:class|id|data-[\w-]+)\s*=\s*['\"][^'\"]*\b(?:testimonial|review)s?\b"
+        r"|[\"“][^\"”\r\n]{3,}[\"”]\s*(?:[-–—]|&(?:mdash|ndash);)\s*"
+        r"[A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*){0,3}(?:\s*,\s*[^\r\n]{2,80})?",
         re.I,
     ),
     "unsupported_customer_count": re.compile(r"\b\d[\d,]*(?:\.\d+)?\+?\s+(?:customers?|users?|buyers?)\b", re.I),
@@ -36,6 +42,12 @@ FORBIDDEN_CLAIMS = {
         r"|<(?:s|strike|del)\b[^>]*>\s*\$?\d",
         re.I,
     ),
+    "unsupported_urgency_scarcity": re.compile(
+        r"\b(?:limited[-\s]?time(?:\s+offer)?|buy\s+now|act\s+now|last\s+chance|"
+        r"before\s+(?:midnight|tonight|it'?s\s+gone)|only\s+\d+\s+(?:left|remaining)|"
+        r"while\s+supplies\s+last)\b",
+        re.I,
+    ),
     "unsupported_benchmark": re.compile(
         r"\b\d+(?:\.\d+)?\s*x\s+(?:faster|slower|cheaper|more\s+efficient)\b"
         r"|\$\d+(?:\.\d+)?\s*(?:per|/)\s*\w+"
@@ -46,6 +58,14 @@ FORBIDDEN_CLAIMS = {
     ),
     "unsupported_affiliation_claim": re.compile(r"\b(?:official(?:ly)?|partnered|certified|endorsed)\b", re.I),
 }
+MARKDOWN_CROSSED_OUT_PRICE = re.compile(r"~~\s*\$?\d[\d,]*(?:\.\d+)?\s*~~")
+CSS_CROSSED_OUT_PRICE = re.compile(
+    r"(?:[.#][\w-]*(?:old|original|was)[\w-]*price[\w-]*|"
+    r"[.#][\w-]*price[\w-]*(?:old|original|was)[\w-]*)\s*\{[^}]{0,240}"
+    r"\btext-decoration(?:-line)?\s*:\s*[^;}]*\bline-through\b"
+    r"|style\s*=\s*['\"][^'\"]*\btext-decoration(?:-line)?\s*:\s*[^'\"]*\bline-through\b[^'\"]*['\"][^>]*>\s*\$?\d",
+    re.I,
+)
 SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"\bgh[opusr]_[A-Za-z0-9]{20,}\b"),
@@ -53,10 +73,11 @@ SECRET_PATTERNS = (
 )
 PLACEHOLDER_PATTERN = re.compile(r"\bYOUR_[A-Z0-9_]+\b")
 SENSITIVE_NAME_PATTERN = re.compile(r"(?:^|[._-])(?:auth|session|state)(?:$|[._-])", re.I)
-THIRD_PARTY_DIRECTORY_NAMES = {"third_party", "vendor"}
+THIRD_PARTY_DIRECTORY_NAMES = {"third_party", "third-party", "thirdparty", "vendor"}
 COMPATIBLE_LICENSES = {"MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "CC0-1.0"}
 NOTICE_FILE_NAME = "THIRD_PARTY_NOTICES.md"
 NOTICE_SECTION_PATTERN = re.compile(r"^##\s+(.+?)\s*$", re.M)
+NO_THIRD_PARTY_CODE_PATTERN = re.compile(r"\bno\s+third[-\s]party\s+code\b", re.I)
 
 
 @dataclass(frozen=True)
@@ -74,6 +95,8 @@ def audit_text(text: str, path: str = "") -> list[AuditFinding]:
     for code, pattern in FORBIDDEN_CLAIMS.items():
         if pattern.search(text):
             findings.append(AuditFinding(code, path))
+    if MARKDOWN_CROSSED_OUT_PRICE.search(text) or CSS_CROSSED_OUT_PRICE.search(text):
+        findings.append(AuditFinding("unsupported_discount_claim", path))
     if any(pattern.search(text) for pattern in SECRET_PATTERNS):
         findings.append(AuditFinding("secret_like_value", path))
     if PLACEHOLDER_PATTERN.search(text):
@@ -92,10 +115,14 @@ def _is_binary(content: bytes) -> bool:
 
 def _third_party_components(source_root: Path) -> set[str]:
     components: set[str] = set()
-    for directory_name in THIRD_PARTY_DIRECTORY_NAMES:
-        directory = source_root / directory_name
-        if directory.is_dir() and not directory.is_symlink():
-            components.update(child.name for child in directory.iterdir())
+    for directory in sorted(source_root.rglob("*")):
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        if directory.name.casefold() not in THIRD_PARTY_DIRECTORY_NAMES:
+            continue
+        directory_identity = directory.relative_to(source_root).as_posix()
+        for child in sorted(directory.iterdir()):
+            components.add(f"{directory_identity}/{child.name}")
     return components
 
 
@@ -123,15 +150,15 @@ def _notice_entries(notice_text: str) -> tuple[dict[str, tuple[str, str]], set[s
 
 def _audit_third_party_notices(source_root: Path) -> list[AuditFinding]:
     components = _third_party_components(source_root)
-    if not components:
-        return []
     notice_path = source_root / NOTICE_FILE_NAME
     if not notice_path.is_file() or notice_path.is_symlink():
-        return [AuditFinding("missing_third_party_notices", NOTICE_FILE_NAME)]
-    entries, invalid_entries, duplicate_entries = _notice_entries(
-        notice_path.read_text(encoding="utf-8", errors="replace")
-    )
+        return [AuditFinding("missing_third_party_notices", NOTICE_FILE_NAME)] if components else []
+    notice_text = notice_path.read_text(encoding="utf-8", errors="replace")
+    entries, invalid_entries, duplicate_entries = _notice_entries(notice_text)
     findings: list[AuditFinding] = []
+    if not components and not entries and not invalid_entries and not duplicate_entries:
+        if not NO_THIRD_PARTY_CODE_PATTERN.search(notice_text):
+            findings.append(AuditFinding("invalid_third_party_notices", NOTICE_FILE_NAME))
     for component in sorted(components - entries.keys() - invalid_entries):
         findings.append(AuditFinding("missing_third_party_component_notice", component))
     for component in sorted(entries.keys() - components):
@@ -141,7 +168,7 @@ def _audit_third_party_notices(source_root: Path) -> list[AuditFinding]:
     for component in sorted(duplicate_entries):
         findings.append(AuditFinding("duplicate_third_party_notice", component))
     for component, (_, license_name) in sorted(entries.items()):
-        if component in components and license_name not in COMPATIBLE_LICENSES:
+        if license_name not in COMPATIBLE_LICENSES:
             findings.append(AuditFinding("incompatible_third_party_license", component, license_name))
     return findings
 

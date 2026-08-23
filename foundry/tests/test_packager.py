@@ -96,6 +96,14 @@ class PackagerTests(unittest.TestCase):
         with self.assertRaises(PackagingError):
             build_release(self.source_dir, self.dist_dir / "release.zip", self.metadata(), repo_root=self.root)
 
+    def test_rejects_case_variants_of_reserved_root_manifest_name(self):
+        for name in ("release-manifest.json", "Release-Manifest.Json"):
+            with self.subTest(name=name):
+                self.write(name, "{}\n")
+                with self.assertRaises(PackagingError):
+                    build_release(self.source_dir, self.dist_dir / "release.zip", self.metadata(), repo_root=self.root)
+                (self.source_dir / name).unlink()
+
 
 if __name__ == "__main__":
     unittest.main()
