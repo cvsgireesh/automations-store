@@ -8,6 +8,7 @@ from foundry.src.collector import (
     parse_github_release,
     parse_gumroad_product,
     parse_gumroad_search,
+    parse_pypistats_recent,
 )
 
 
@@ -54,12 +55,27 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(signal.title, "Hermes 0.20.5")
         self.assertEqual(signal.metrics["tag_name"], "v0.20.5")
 
+    def test_parses_pypistats_adoption_metrics(self):
+        signal = parse_pypistats_recent(
+            fixture("pypistats-recent.json"),
+            "https://pypistats.org/api/packages/hermes-agent/recent",
+            "2026-08-23T00:00:00Z",
+            "pypistats",
+        )
+        self.assertEqual(signal.source_type, "adoption_signal")
+        self.assertEqual(signal.metrics["last_month"], 1098)
+        self.assertEqual(signal.independence_key, "pypistats")
+
     def test_collect_uses_bounded_fixture_responses(self):
         config = json.loads((FIXTURES.parent.parent / "config.json").read_text(encoding="utf-8"))
         signals = collect(config, "2026-08-23T00:00:00Z", FIXTURES)
         self.assertEqual([signal.source_type for signal in signals], [
-            "market_search", "paid_comparable", "official_release"
+            "paid_comparable", "adoption_signal", "official_release"
         ])
+        self.assertEqual(
+            [signal.independence_key for signal in signals],
+            ["gumroad", "pypistats", "github"],
+        )
 
 
 if __name__ == "__main__":

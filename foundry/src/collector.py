@@ -85,7 +85,8 @@ def _required_text(text: str, pattern: str) -> str:
     return re.sub(r"\s+", " ", _required_match(text, pattern)).strip()
 
 
-def parse_gumroad_product(html_text: str, url: str, observed_at: str) -> Signal:
+def parse_gumroad_product(html_text: str, url: str, observed_at: str,
+                          independence_key: str = "gumroad") -> Signal:
     decoded = html.unescape(html_text)
     price = _required_float(decoded, r'product:price:amount[^>]+content="([0-9.]+)"')
     sales = _required_int(decoded, r'"sales_count"\s*:\s*(\d+)')
@@ -99,10 +100,12 @@ def parse_gumroad_product(html_text: str, url: str, observed_at: str) -> Signal:
         title,
         {"price": price, "sales_count": sales, "rating_count": ratings},
         sha256(decoded),
+        independence_key,
     )
 
 
-def parse_gumroad_search(html_text: str, url: str, observed_at: str) -> Signal:
+def parse_gumroad_search(html_text: str, url: str, observed_at: str,
+                         independence_key: str = "gumroad") -> Signal:
     decoded = html.unescape(html_text)
     title = _required_text(decoded, r"<title[^>]*>(.*?)</title>")
     result_count = _required_int(
@@ -117,10 +120,12 @@ def parse_gumroad_search(html_text: str, url: str, observed_at: str) -> Signal:
         title,
         {"result_count": result_count},
         sha256(decoded),
+        independence_key,
     )
 
 
-def parse_github_release(json_text: str, url: str, observed_at: str) -> Signal:
+def parse_github_release(json_text: str, url: str, observed_at: str,
+                         independence_key: str = "github") -> Signal:
     try:
         release = json.loads(json_text)
     except json.JSONDecodeError as error:
@@ -140,13 +145,46 @@ def parse_github_release(json_text: str, url: str, observed_at: str) -> Signal:
         title,
         {"tag_name": tag_name, "published_at": published_at},
         sha256(json_text),
+        independence_key,
     )
 
 
-PARSERS: dict[str, Callable[[str, str, str], Signal]] = {
+def parse_pypistats_recent(json_text: str, url: str, observed_at: str,
+                           independence_key: str = "pypistats") -> Signal:
+    """Normalize the bounded recent-download response from PyPIStats."""
+    try:
+        payload = json.loads(json_text)
+    except json.JSONDecodeError as error:
+        raise ValueError("PyPIStats response is not valid JSON") from error
+    if not isinstance(payload, dict):
+        raise ValueError("PyPIStats response must be a JSON object")
+    package = payload.get("package")
+    data = payload.get("data")
+    if not isinstance(package, str) or not package or not isinstance(data, dict):
+        raise ValueError("PyPIStats response is missing package or data")
+    metrics: dict[str, int] = {}
+    for period in ("last_day", "last_week", "last_month"):
+        value = data.get(period)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"PyPIStats response is missing valid {period}")
+        metrics[period] = value
+    return Signal(
+        stable_id(url, observed_at[:10]),
+        url,
+        "adoption_signal",
+        observed_at,
+        f"PyPI download activity for {package}",
+        metrics,
+        sha256(json_text),
+        independence_key,
+    )
+
+
+PARSERS: dict[str, Callable[[str, str, str, str], Signal]] = {
     "gumroad_product": parse_gumroad_product,
     "gumroad_search": parse_gumroad_search,
     "github_release": parse_github_release,
+    "pypistats_recent": parse_pypistats_recent,
 }
 
 
@@ -187,8 +225,11 @@ def collect(config: Mapping[str, Any] | str | Path, observed_at: str,
             raise ValueError("each configured source must be an object")
         url = source.get("url")
         parser_name = source.get("parser")
+        independence_key = source.get("independence_key")
         if not isinstance(url, str) or not isinstance(parser_name, str):
             raise ValueError("each source requires string url and parser fields")
+        if not isinstance(independence_key, str) or not independence_key.strip():
+            raise ValueError("each source requires a non-empty independence_key")
         _validate_url(url, allowed_hosts)
         parser = PARSERS.get(parser_name)
         if parser is None:
@@ -200,7 +241,7 @@ def collect(config: Mapping[str, Any] | str | Path, observed_at: str,
             if not isinstance(fixture_name, str):
                 raise ValueError("fixture collection requires each source fixture name")
             response_text = _read_fixture(root, fixture_name)
-        signal = parser(response_text, url, observed_at)
+        signal = parser(response_text, url, observed_at, independence_key)
         configured_type = source.get("source_type")
         if configured_type is not None and configured_type != signal.source_type:
             raise ValueError("configured source type does not match parser output")

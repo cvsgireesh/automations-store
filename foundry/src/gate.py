@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence, Set
-from urllib.parse import urlsplit
-
 from .models import Candidate, GateDecision, Signal
 
 
@@ -25,9 +23,9 @@ def evaluate(candidate: Candidate, signals: Sequence[Signal], ledger: Set[str]) 
     candidate_signal_ids = set(candidate.signal_ids)
     matched = [signal for signal in signals if signal.signal_id in candidate_signal_ids]
     independent = {
-        hostname.lower()
+        signal.independence_key.casefold().strip()
         for signal in matched
-        if (hostname := urlsplit(signal.source_url).hostname) is not None
+        if isinstance(signal.independence_key, str) and signal.independence_key.strip()
     }
     reasons: list[str] = []
     if len(independent) < 3:

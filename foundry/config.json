@@ -2,26 +2,30 @@
   "allowed_hosts": [
     "gumroad.com",
     "api.github.com",
-    "github.com"
+    "github.com",
+    "pypistats.org"
   ],
   "sources": [
-    {
-      "url": "https://gumroad.com/discover?query=Hermes%20Agent",
-      "source_type": "market_search",
-      "parser": "gumroad_search",
-      "fixture": "gumroad-search.html"
-    },
     {
       "url": "https://gumroad.com/l/hermes-workflow-playbook",
       "source_type": "paid_comparable",
       "parser": "gumroad_product",
-      "fixture": "gumroad-product.html"
+      "fixture": "gumroad-product.html",
+      "independence_key": "gumroad"
+    },
+    {
+      "url": "https://pypistats.org/api/packages/hermes-agent/recent",
+      "source_type": "adoption_signal",
+      "parser": "pypistats_recent",
+      "fixture": "pypistats-recent.json",
+      "independence_key": "pypistats"
     },
     {
       "url": "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest",
       "source_type": "official_release",
       "parser": "github_release",
-      "fixture": "github-release.json"
+      "fixture": "github-release.json",
+      "independence_key": "github"
     }
   ]
 }

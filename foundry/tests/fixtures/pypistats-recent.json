@@ -1,0 +1,9 @@
+{
+  "data": {
+    "last_day": 37,
+    "last_week": 241,
+    "last_month": 1098
+  },
+  "package": "hermes-agent",
+  "type": "recent_downloads"
+}

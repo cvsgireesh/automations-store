@@ -17,20 +17,30 @@ def candidate(signal_ids: tuple[str, ...] = ("paid", "official", "buyer")) -> Ca
     )
 
 
-def signal(signal_id: str, source_url: str, source_type: str, metrics: dict) -> Signal:
-    return Signal(signal_id, source_url, source_type, OBSERVED_AT, signal_id, metrics, "hash")
+def signal(signal_id: str, source_url: str, source_type: str, metrics: dict,
+           independence_key: str) -> Signal:
+    return Signal(
+        signal_id,
+        source_url,
+        source_type,
+        OBSERVED_AT,
+        signal_id,
+        metrics,
+        "hash",
+        independence_key,
+    )
 
 
 def paid_signal() -> Signal:
-    return signal("paid", "https://gumroad.com/l/hermes", "paid_comparable", {"sales_count": 119})
+    return signal("paid", "https://gumroad.com/l/hermes", "paid_comparable", {"sales_count": 119}, "gumroad")
 
 
 def official_signal() -> Signal:
-    return signal("official", "https://api.github.com/repos/example/project/releases/latest", "official_release", {})
+    return signal("official", "https://api.github.com/repos/example/project/releases/latest", "official_release", {}, "github")
 
 
 def buyer_signal() -> Signal:
-    return signal("buyer", "https://github.com/example/project/issues/99", "buyer_pain", {})
+    return signal("buyer", "https://github.com/example/project/issues/99", "buyer_pain", {}, "buyer_forum")
 
 
 class GateTests(unittest.TestCase):
@@ -54,12 +64,28 @@ class GateTests(unittest.TestCase):
             "https://example.org/competitor",
             "paid_comparable",
             {"sales_count": 999},
+            "competitor",
         )
         decision = evaluate(candidate(("official", "buyer")), [official_signal(), buyer_signal(), unrelated], set())
         self.assertEqual(
             decision.reasons,
             ("need_at_least_3_independent_signals", "need_paid_transactional_evidence"),
         )
+
+    def test_github_hostnames_with_one_independence_key_count_once(self):
+        github_issue = signal(
+            "github-issue",
+            "https://github.com/example/project/issues/99",
+            "buyer_pain",
+            {},
+            "github",
+        )
+        decision = evaluate(
+            candidate(("paid", "official", "github-issue")),
+            [paid_signal(), official_signal(), github_issue],
+            set(),
+        )
+        self.assertEqual(decision.reasons, ("need_at_least_3_independent_signals",))
 
 
 if __name__ == "__main__":
