@@ -1,457 +1,109 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Hermes Skill Packs — Portable Automations for AI Agents</title>
-  <meta name="description" content="Professional-grade Hermes AI agent skill packs. Copy-paste automation blueprints that give any AI agent expert-level skills in seconds.">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="One pending, evidence-based Hermes operator kit for local routine work and deliberate escalation.">
+  <title>HermesPacks — Hybrid Operator Kit</title>
   <link rel="stylesheet" href="css/style.css">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <script defer src="js/main.js"></script>
 </head>
 <body>
-  <!-- Header -->
-  <header class="header">
-    <div class="container">
-      <div class="header-content">
-        <div class="logo">
-          <span class="logo-icon">⚡</span>
-          <span class="logo-text">Hermes<span class="logo-accent">Packs</span></span>
-        </div>
-        <nav class="nav">
-          <a href="#products">Products</a>
-          <a href="#how-it-works">How It Works</a>
-          <a href="#faq">FAQ</a>
-          <a href="#testimonials">Testimonials</a>
-        </nav>
-        <a href="#all-access" class="btn btn-gold">Get All Access</a>
-      </div>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <header class="site-header">
+    <div class="container header-row">
+      <a class="brand" href="index.html" aria-label="HermesPacks home">Hermes<span>Packs</span></a>
+      <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="primary-nav">Menu</button>
+      <nav id="primary-nav" class="site-nav" aria-label="Primary navigation">
+        <a href="#kit">The kit</a>
+        <a href="#scope">Scope</a>
+        <a href="proof.html">Proof</a>
+      </nav>
     </div>
   </header>
 
-  <!-- Hero -->
-  <section class="hero">
-    <div class="container">
-      <div class="hero-content">
-        <div class="hero-badge">New: 7 Professional Skill Packs</div>
-        <h1 class="hero-title">
-          Give Your AI Agent<br>
-          <span class="gradient-text">Expert-Level Skills</span>
-        </h1>
-        <p class="hero-subtitle">
-          Professional-grade automation blueprints for Hermes AI agents. 
-          One-click installation, enterprise-quality results. 
-          Stop building from scratch — deploy battle-tested automations.
-        </p>
-        <div class="hero-buttons">
-          <a href="#products" class="btn btn-primary">Browse All Packs</a>
-          <a href="#how-it-works" class="btn btn-secondary">How It Works →</a>
+  <main id="main-content">
+    <section class="hero">
+      <div class="container hero-grid">
+        <div>
+          <p class="eyebrow">Hermes hybrid operator kit</p>
+          <h1>Run Hermes locally for routine work. Escalate the work that matters.</h1>
+          <p class="lede">A focused set of operating materials for separating routine local work from decisions that need deliberate review.</p>
+          <div class="hero-actions">
+            <a class="button button-primary" data-checkout-cta href="order.html">Checkout setup status</a>
+            <a class="button button-secondary" href="proof.html">Read the proof page</a>
+          </div>
+          <p class="status-line" data-checkout-message>Checkout status: pending.</p>
         </div>
-        <div class="hero-stats">
-          <div class="stat">
-            <span class="stat-number">47+</span>
-            <span class="stat-label">Skills Included</span>
-          </div>
-          <div class="stat">
-            <span class="stat-number">7</span>
-            <span class="stat-label">Specialized Packs</span>
-          </div>
-          <div class="stat">
-            <span class="stat-number">∞</span>
-            <span class="stat-label">Lifetime Updates</span>
-          </div>
-        </div>
+        <aside class="hero-note" aria-label="Product summary">
+          <p class="note-label">Launch price</p>
+          <p class="price">$12</p>
+          <p>Digital materials for one workflow. Checkout is not open yet.</p>
+        </aside>
       </div>
-      <div class="hero-visual">
-        <div class="code-window">
-          <div class="code-window-header">
-            <span class="dot red"></span>
-            <span class="dot yellow"></span>
-            <span class="dot green"></span>
-            <span class="code-title">hermes skill install</span>
-          </div>
-          <div class="code-window-body">
-            <code>
-              <span class="code-line"><span class="comment"># Install Research Suite</span></span>
-              <span class="code-line"><span class="prompt">$</span> hermes skill pack install <span class="highlight">research</span></span>
-              <span class="code-line">✓ Installing 6 skills...</span>
-              <span class="code-line">✓ arxiv, polymarket, blogwatcher</span>
-              <span class="code-line">✓ llm-wiki, landscape-research</span>
-              <span class="code-line">✓ recurring-intelligence-briefings</span>
-              <span class="code-line">✓ <span class="success">Research Suite ready!</span></span>
-            </code>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- Products Grid -->
-  <section id="products" class="products">
-    <div class="container">
-      <div class="section-header">
-        <h2 class="section-title">Choose Your Skill Pack</h2>
-        <p class="section-subtitle">Each pack is a complete, tested automation system — not just documentation.</p>
-      </div>
-
-      <div class="product-grid">
-        <!-- Product 1: AI Research -->
-        <div class="product-card featured">
-          <div class="product-badge">Best Seller</div>
-          <div class="product-icon">🔬</div>
-          <h3 class="product-name">AI Research Suite</h3>
-          <p class="product-description">
-            Turn any AI agent into a professional research analyst. 
-            Search arxiv, track preprints, monitor blogs, analyze markets.
-          </p>
-          <ul class="product-features">
-            <li>arxiv — Paper search & discovery</li>
-            <li>polymarket — Prediction market data</li>
-            <li>blogwatcher — RSS/blog monitoring</li>
-            <li>llm-wiki — Knowledge base building</li>
-            <li>landscape-research — Market analysis</li>
-            <li>recurring-intelligence-briefings — Automated daily briefs</li>
-            <li>research-paper-writing — Full paper writing pipeline</li>
-          </ul>
-          <div class="product-pricing">
-            <span class="product-price">$19</span>
-            <span class="product-original">$49</span>
-          </div>
-          <a href="order.html?pack=research-suite" class="btn btn-primary full-width">Buy Research Suite →</a>
-        </div>
-
-        <!-- Product 2: Creative Studio -->
-        <div class="product-card">
-          <div class="product-icon">🎨</div>
-          <h3 class="product-name">Creative Studio</h3>
-          <p class="product-description">
-            Full creative automation suite. Generate images, video, audio, 
-            infographics, and design assets on demand.
-          </p>
-          <ul class="product-features">
-            <li>comfyui — AI image/video generation</li>
-            <li>manim-video — Math & algorithm animations</li>
-            <li>ascii-art — Terminal art & ASCII generation</li>
-            <li>ascii-video — Text-to-ASCII video</li>
-            <li>infographic — Professional infographics (21 layouts)</li>
-            <li>claude-design — UI/UX design prototyping</li>
-            <li>touchdesigner-mcp — Real-time visuals</li>
-            <li>songwriting — AI music generation</li>
-          </ul>
-          <div class="product-pricing">
-            <span class="product-price">$24</span>
-            <span class="product-original">$59</span>
-          </div>
-          <a href="order.html?pack=creative-studio" class="btn btn-primary full-width">Buy Creative Studio →</a>
-        </div>
-
-        <!-- Product 3: DevOps & GitHub -->
-        <div class="product-card">
-          <div class="product-icon">⚙️</div>
-          <h3 class="product-name">DevOps & GitHub</h3>
-          <p class="product-description">
-            Professional GitHub workflows, code review, CI/CD, and 
-            repository management — all automated.
-          </p>
-          <ul class="product-features">
-            <li>github-pr-workflow — Full PR lifecycle</li>
-            <li>github-code-review — Automated reviews</li>
-            <li>github-issues — Issue triage & management</li>
-            <li>github-repo-management — Clone, fork, release</li>
-            <li>github-profile — Profile README automation</li>
-            <li>codebase-inspection — LOC & analysis</li>
-            <li>systematic-debugging — 4-phase root cause</li>
-          </ul>
-          <div class="product-pricing">
-            <span class="product-price">$19</span>
-            <span class="product-original">$49</span>
-          </div>
-          <a href="order.html?pack=devops-github" class="btn btn-primary full-width">Buy DevOps Pack →</a>
-        </div>
-
-        <!-- Product 4: ML/LLM Ops -->
-        <div class="product-card">
-          <div class="product-icon">🧠</div>
-          <h3 class="product-name">ML/LLM Operations</h3>
-          <p class="product-description">
-            Full MLOps toolkit — train, evaluate, serve, and benchmark 
-            large language models with confidence.
-          </p>
-          <ul class="product-features">
-            <li>huggingface-hub — Model discovery & management</li>
-            <li>vllm — High-throughput LLM serving</li>
-            <li>llama-cpp — Local inference & quantization</li>
-            <li>lm-eval-harness — Model benchmarking</li>
-            <li>weights-and-biases — Experiment tracking</li>
-            <li>segment-anything — Image segmentation</li>
-            <li>audiocraft — Audio generation</li>
-          </ul>
-          <div class="product-pricing">
-            <span class="product-price">$24</span>
-            <span class="product-original">$59</span>
-          </div>
-          <a href="order.html?pack=ml-ops" class="btn btn-primary full-width">Buy ML Ops Pack →</a>
-        </div>
-
-        <!-- Product 5: Content & Media -->
-        <div class="product-card">
-          <div class="product-icon">🎬</div>
-          <h3 class="product-name">Content & Media</h3>
-          <p class="product-description">
-            YouTube analysis, audio processing, GIF search, and content 
-            generation — full media automation suite.
-          </p>
-          <ul class="product-features">
-            <li>youtube-content — Transcripts & analysis</li>
-            <li>songsee — Audio spectrograms & features</li>
-            <li>gif-search — Tenor GIF integration</li>
-            <li>heartmula — AI music generation</li>
-            <li>pretext — Interactive demos & art</li>
-            <li>p5js — Creative coding & visualization</li>
-          </ul>
-          <div class="product-pricing">
-            <span class="product-price">$14</span>
-            <span class="product-original">$39</span>
-          </div>
-          <a href="order.html?pack=content-media" class="btn btn-primary full-width">Buy Content Pack →</a>
-        </div>
-
-        <!-- Product 6: Productivity Stack -->
-        <div class="product-card">
-          <div class="product-icon">📊</div>
-          <h3 class="product-name">Productivity Stack</h3>
-          <p class="product-description">
-            Email, calendar, documents, spreadsheets, PDFs, and more — 
-            professional productivity automation.
-          </p>
-          <ul class="product-features">
-            <li>himalaya — Terminal email (IMAP/SMTP)</li>
-            <li>google-workspace — Gmail, Calendar, Drive, Sheets</li>
-            <li>notion — Pages, databases, markdown</li>
-            <li>powerpoint — PPTX creation & editing</li>
-            <li>ocr-and-documents — PDF text extraction</li>
-            <li>nano-pdf — PDF text editing</li>
-            <li>maps — Geocode, POIs, routes</li>
-            <li>apple-notes & apple-reminders — Apple integration</li>
-            <li>dashboard-server — Live data dashboards</li>
-          </ul>
-          <div class="product-pricing">
-            <span class="product-price">$19</span>
-            <span class="product-original">$49</span>
-          </div>
-          <a href="order.html?pack=productivity" class="btn btn-primary full-width">Buy Productivity Pack →</a>
-        </div>
-
-        <!-- Product 7: Apple Automation -->
-        <div class="product-card">
-          <div class="product-icon">🍎</div>
-          <h3 class="product-name">Apple Ecosystem</h3>
-          <p class="product-description">
-            Deep Apple integration — Notes, Reminders, iMessage, and 
-            device tracking. Your Mac as a command center.
-          </p>
-          <ul class="product-features">
-            <li>apple-notes — Create, search, edit notes</li>
-            <li>apple-reminders — Add, list, complete tasks</li>
-            <li>imessage — Send & receive iMessages/SMS</li>
-            <li>findmy — Track devices & AirTags</li>
-          </ul>
-          <div class="product-pricing">
-            <span class="product-price">$14</span>
-            <span class="product-original">$39</span>
-          </div>
-          <a href="order.html?pack=apple-ecosystem" class="btn btn-primary full-width">Buy Apple Pack →</a>
-        </div>
-
-        <!-- ALL ACCESS -->
-        <div class="product-card all-access" id="all-access">
-          <div class="product-badge all-access-badge">Best Value</div>
-          <div class="product-icon">🚀</div>
-          <h3 class="product-name">All Access Pass</h3>
-          <p class="product-description">
-            Everything. Every pack. Lifetime updates. Future packs included 
-            at no extra cost. The complete Hermes automation toolkit.
-          </p>
-          <ul class="product-features all-access-features">
-            <li>✓ AI Research Suite</li>
-            <li>✓ Creative Studio</li>
-            <li>✓ DevOps & GitHub</li>
-            <li>✓ ML/LLM Operations</li>
-            <li>✓ Content & Media</li>
-            <li>✓ Productivity Stack</li>
-            <li>✓ Apple Ecosystem</li>
-            <li>✓ Future packs (free)</li>
-            <li>✓ Priority support</li>
-          </ul>
-          <div class="product-pricing all-access-pricing">
-            <span class="product-price">$49</span>
-            <span class="product-original">$228</span>
-          </div>
-          <a href="order.html?pack=all-access" class="btn btn-gold full-width">Get All Access →</a>
-          <p class="all-access-savings">Save $179 — 78% off individual packs</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- How It Works -->
-  <section id="how-it-works" class="how-it-works">
-    <div class="container">
-      <div class="section-header">
-        <h2 class="section-title">How It Works</h2>
-        <p class="section-subtitle">Three steps to professional-grade AI automation.</p>
-      </div>
-      <div class="steps-grid">
-        <div class="step-card">
-          <div class="step-number">01</div>
-          <h3>Choose Your Pack</h3>
-          <p>Pick the automation suite that matches your workflow. 
-          Single packs or the All Access bundle for everything.</p>
-        </div>
-        <div class="step-card">
-          <div class="step-number">02</div>
-          <h3>Install Instantly</h3>
-          <p>Download your pack and run a single install command. 
-          Skills are ready in seconds — no configuration needed.</p>
-        </div>
-        <div class="step-card">
-          <div class="step-number">03</div>
-          <h3>Automate Everything</h3>
-          <p>Your AI agent now has expert-level skills. 
-          Research, create, build, and deploy — professionally.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- FAQ -->
-  <section id="faq" class="faq">
-    <div class="container">
-      <div class="section-header">
-        <h2 class="section-title">Frequently Asked Questions</h2>
-      </div>
-      <div class="faq-grid">
-        <div class="faq-item">
-          <h3>What exactly is a "skill pack"?</h3>
-          <p>A skill pack is a curated collection of professional-grade Hermes agent skills — 
-          complete automation blueprints with all references, templates, and scripts included. 
-          Think of it as hiring a specialist team, but they come pre-loaded into your AI.</p>
-        </div>
-        <div class="faq-item">
-          <h3>Do I need to be technical?</h3>
-          <p>Basic terminal familiarity helps, but our packs are designed to be 
-          copy-paste simple. If you can run a command, you can install a pack. 
-          We include setup guides and troubleshooting for every pack.</p>
-        </div>
-        <div class="faq-item">
-          <h3>Are these updated regularly?</h3>
-          <p>Yes. Every pack includes lifetime updates. When APIs change, new features 
-          drop, or improvements are made, your pack updates automatically. 
-          All Access members get priority access to new packs.</p>
-        </div>
-        <div class="faq-item">
-          <h3>What's included in All Access?</h3>
-          <p>Everything. All current packs plus every new pack we release in the future. 
-          It's a one-time payment — no subscriptions, no recurring fees. 
-          You own your packs forever.</p>
-        </div>
-        <div class="faq-item">
-          <h3>Do you offer refunds?</h3>
-          <p>Absolutely. If you're not satisfied within 14 days, 
-          we'll refund you in full. No questions asked.</p>
-        </div>
-        <div class="faq-item">
-          <h3>Can I share my packs?</h3>
-          <p>Each license is for personal use only. If you want to share, 
-          we offer team licenses at a discounted rate. Contact us for details.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Testimonials -->
-  <section id="testimonials" class="testimonials">
-    <div class="container">
-      <div class="section-header">
-        <h2 class="section-title">What People Are Saying</h2>
-      </div>
-      <div class="testimonials-grid">
-        <div class="testimonial-card">
-          <div class="testimonial-stars">★★★★★</div>
-          <p>"The Research Suite alone saved me hours of arxiv searching. 
-          My AI agent now produces better literature reviews than my last research assistant."</p>
-          <div class="testimonial-author">
-            <div class="author-avatar">AK</div>
-            <div class="author-info">
-              <span class="author-name">Alex K.</span>
-              <span class="author-role">ML Researcher</span>
+    <section id="kit" class="section">
+      <div class="container narrow">
+        <p class="eyebrow">One product</p>
+        <article class="product-card" data-product-card="true">
+          <div class="product-heading">
+            <div>
+              <h2>Hermes Hybrid Operator Kit</h2>
+              <p>Launch price: $12. The price is shown without comparisons or discounts.</p>
             </div>
+            <a class="button button-primary" data-checkout-cta href="order.html">Checkout setup status</a>
           </div>
-        </div>
-        <div class="testimonial-card">
-          <div class="testimonial-stars">★★★★★</div>
-          <p>"I bought the All Access pass after trying the Research Suite. 
-          The Creative Studio packs are incredible — my design work output tripled."</p>
-          <div class="testimonial-author">
-            <div class="author-avatar">SM</div>
-            <div class="author-info">
-              <span class="author-name">Sarah M.</span>
-              <span class="author-role">Creative Director</span>
-            </div>
+          <div class="inclusions">
+            <section>
+              <h3>Included</h3>
+              <ul>
+                <li>Generator</li>
+                <li>redacted preflight</li>
+                <li>safe installers</li>
+                <li>routing checklist</li>
+                <li>rollback checklist</li>
+                <li>four failure drills</li>
+              </ul>
+            </section>
+            <section>
+              <h3>Update window</h3>
+              <p>This product includes a 30-day update window beginning with its first packaged release.</p>
+            </section>
           </div>
-        </div>
-        <div class="testimonial-card">
-          <div class="testimonial-stars">★★★★★</div>
-          <p>"The DevOps pack transformed our GitHub workflow. Automated code review 
-          catches issues we were missing. Worth 10x what I paid."</p>
-          <div class="testimonial-author">
-            <div class="author-avatar">JL</div>
-            <div class="author-info">
-              <span class="author-name">James L.</span>
-              <span class="author-role">DevOps Lead</span>
-            </div>
-          </div>
-        </div>
+        </article>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- CTA -->
-  <section class="cta">
-    <div class="container">
-      <div class="cta-content">
-        <h2>Ready to Level Up Your AI Agent?</h2>
-        <p>Join hundreds of developers who've transformed their workflows 
-        with professional Hermes skill packs.</p>
-        <div class="cta-buttons">
-          <a href="#all-access" class="btn btn-gold btn-large">Get All Access — $49</a>
-          <a href="#products" class="btn btn-outline btn-large">Browse Single Packs</a>
-        </div>
-        <p class="cta-note">14-day money-back guarantee • Lifetime updates • Instant delivery</p>
+    <section id="scope" class="section section-muted">
+      <div class="container narrow split-copy">
+        <section>
+          <p class="eyebrow">Tested scope</p>
+          <h2>Pending, and limited to fresh canaries.</h2>
+          <p>Release verification has not completed. The current tested scope is pending and limited to fresh canaries; this page makes no production-performance, cost, or reliability claim.</p>
+        </section>
+        <section>
+          <p class="eyebrow">What remains free</p>
+          <h2>Architecture stays public.</h2>
+          <p>The free architecture repository remains separate from this paid kit. HermesPacks is an independent resource and is not affiliated with Hermes Agent, its maintainers, or its contributors.</p>
+        </section>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- Footer -->
-  <footer class="footer">
-    <div class="container">
-      <div class="footer-content">
-        <div class="footer-brand">
-          <span class="logo-icon">⚡</span>
-          <span class="logo-text">Hermes<span class="logo-accent">Packs</span></span>
-        </div>
-        <div class="footer-links">
-          <a href="#products">Products</a>
-          <a href="#how-it-works">How It Works</a>
-          <a href="#faq">FAQ</a>
-          <a href="mailto:hello@hermespacks.com">Contact</a>
-        </div>
-        <div class="footer-legal">
-          <p>© 2026 HermesPacks. All rights reserved.</p>
-          <p>Not affiliated with Nous Research. Hermes is a trademark of Nous Research.</p>
-        </div>
+    <section class="section">
+      <div class="container narrow callout">
+        <p class="eyebrow">Checkout</p>
+        <h2>Checkout setup is pending.</h2>
+        <p>A Gumroad product URL will be used only after its account owner completes payout onboarding and confirms publication. Until then, there is no purchase link.</p>
+        <a class="button button-primary" data-checkout-cta href="order.html">Checkout setup status</a>
       </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-row">
+      <p>HermesPacks</p>
+      <a href="proof.html">Proof and test scope</a>
     </div>
   </footer>
 </body>

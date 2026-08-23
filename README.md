@@ -1,59 +1,26 @@
-# HermesPacks Store
+# HermesPacks storefront
 
-A modern, professional e-commerce site for selling Hermes AI agent skill packs.
+This is a dependency-free static storefront for one pre-release product: the Hermes Hybrid Operator Kit.
 
-## Tech Stack
+## Current state
 
-- **Static Site**: Pure HTML/CSS/JS (no build step)
-- **Hosting**: GitHub Pages (free)
-- **Payments**: Gumroad (free to start, takes % per sale)
-- **Design**: Dark theme, professional aesthetic
+- Launch price: $12
+- Checkout: pending; no purchase link is published
+- Updates: a 30-day update window begins with the first packaged release
+- Verification: `proof.html` records the current pending test scope and will publish the archive hash with the first packaged release
 
-## Structure
+## Product scope
 
+The kit describes a Generator, redacted preflight, safe installers, routing and rollback checklists, and four failure drills. It does not make production-performance, customer, cost-saving, or availability claims.
+
+The free architecture repository is separate from this product. HermesPacks is not affiliated with Hermes Agent, its maintainers, or its contributors.
+
+## Local check
+
+Run the public tests from the repository root:
+
+```text
+python3 -m unittest foundry.tests.test_storefront -v
 ```
-automations-store/
-├── index.html          # Main storefront
-├── css/
-│   └── style.css       # Complete styling
-├── js/
-│   └── main.js         # Interactivity
-├── .github/
-│   └── workflows/      # GitHub Actions for deployment
-└── README.md
-```
 
-## Features
-
-- Responsive design (mobile-first)
-- Smooth scroll animations
-- Product grid with pricing
-- FAQ section
-- Testimonials
-- All Access bundle promotion
-- Professional dark theme
-
-## Deployment
-
-The site is configured to auto-deploy to GitHub Pages when pushed to main branch.
-
-## Gumroad Integration
-
-All product links point to: `https://gumroad.com/hermes-packs/<product-slug>`
-
-Update these URLs with your actual Gumroad store URLs.
-
-## Products
-
-1. AI Research Suite - $19
-2. Creative Studio - $24
-3. DevOps & GitHub - $19
-4. ML/LLM Operations - $24
-5. Content & Media - $14
-6. Productivity Stack - $19
-7. Apple Ecosystem - $14
-8. All Access Pass - $49
-
-## License
-
-© 2026 HermesPacks. All rights reserved.
+For a local browser check, serve the repository root with any static HTTP server and open `index.html`.

@@ -1,78 +1,33 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Order HermesPacks</title>
-  <meta name="description" content="Request a HermesPacks invoice while Gumroad checkout is being configured.">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Current checkout status for the Hermes Hybrid Operator Kit.">
+  <title>Checkout status — HermesPacks</title>
   <link rel="stylesheet" href="css/style.css">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <style>
-    .order-page { min-height: 100vh; padding: 120px 0 80px; }
-    .order-card { max-width: 760px; margin: 0 auto; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius-xl); padding: 40px; box-shadow: var(--shadow-lg); }
-    .order-card h1 { font-size: clamp(2rem, 5vw, 3.5rem); margin-bottom: 12px; }
-    .order-meta { display: flex; gap: 16px; flex-wrap: wrap; margin: 24px 0; }
-    .order-pill { padding: 10px 16px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-secondary); }
-    .order-warning { margin: 24px 0; padding: 18px; border: 1px solid rgba(245,158,11,.45); background: rgba(245,158,11,.08); border-radius: var(--radius-md); color: var(--text-secondary); line-height: 1.6; }
-    .order-actions { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 28px; }
-    .order-note { color: var(--text-tertiary); margin-top: 18px; font-size: .95rem; line-height: 1.6; }
-  </style>
+  <script defer src="js/main.js"></script>
 </head>
 <body>
-  <header class="header">
-    <div class="container">
-      <div class="header-content">
-        <a href="index.html" class="logo" style="text-decoration:none"><span class="logo-icon">⚡</span><span class="logo-text">Hermes<span class="logo-accent">Packs</span></span></a>
-        <nav class="nav"><a href="index.html#products">Products</a><a href="index.html#faq">FAQ</a></nav>
-        <a href="index.html#products" class="btn btn-secondary">Back to packs</a>
-      </div>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <header class="site-header">
+    <div class="container header-row">
+      <a class="brand" href="index.html" aria-label="HermesPacks home">Hermes<span>Packs</span></a>
+      <a class="button button-secondary button-small" href="index.html">Back to product</a>
     </div>
   </header>
-  <main class="order-page">
-    <div class="container">
-      <section class="order-card">
-        <div class="hero-badge">Manual checkout active while Gumroad is configured</div>
-        <h1 id="productName">HermesPacks Order</h1>
-        <p class="hero-subtitle" id="productSummary">Request an invoice for the selected skill pack.</p>
-        <div class="order-meta">
-          <span class="order-pill" id="productPrice">Price: $—</span>
-          <span class="order-pill">Digital delivery</span>
-          <span class="order-pill">Portable Hermes skills</span>
-        </div>
-        <div class="order-warning">
-          <strong>Checkout status:</strong> the storefront is live and styled, but Gumroad product URLs are not created yet. This page prevents fake 404 checkout links and gives buyers a working order-intent path until the real Gumroad links are pasted in.
-        </div>
-        <div class="order-actions">
-          <a id="issueLink" class="btn btn-primary" target="_blank" rel="noopener">Request invoice on GitHub</a>
-          <a href="index.html#products" class="btn btn-secondary">Compare packs</a>
-        </div>
-        <p class="order-note">Do not post payment details or private credentials in the GitHub issue. Use it only to request an invoice or delivery link. Replace this page with Gumroad links once products are created.</p>
-      </section>
-    </div>
+  <main id="main-content" class="order-page">
+    <section class="container narrow status-card" aria-labelledby="checkout-title">
+      <p class="eyebrow">Checkout status</p>
+      <h1 id="checkout-title">Checkout is not open yet.</h1>
+      <p>The Hermes Hybrid Operator Kit has a $12 launch price, but no payment or delivery link is available while checkout setup is pending.</p>
+      <p>Payout onboarding and product publication require the account owner’s financial identity and an action-time confirmation. Those steps are not automated.</p>
+      <p class="status-line" data-checkout-message>Checkout status: pending.</p>
+      <a class="button button-secondary" href="index.html">Return to product details</a>
+    </section>
   </main>
-  <script>
-  const PRODUCTS = {
-    'research-suite': { name: 'AI Research Suite', price: '19', summary: 'Best for researchers, analysts, and market watchers.' },
-    'creative-studio': { name: 'Creative Studio', price: '24', summary: 'Best for creators, designers, and media experiments.' },
-    'devops-github': { name: 'DevOps & GitHub', price: '19', summary: 'Best for developers shipping with GitHub workflows.' },
-    'ml-ops': { name: 'ML/LLM Operations', price: '24', summary: 'Best for local-model, evaluation, and inference workflows.' },
-    'content-media': { name: 'Content & Media', price: '14', summary: 'Best for YouTube, audio, and content automation.' },
-    'productivity': { name: 'Productivity Stack', price: '19', summary: 'Best for documents, email, notes, dashboards, and everyday ops.' },
-    'apple-ecosystem': { name: 'Apple Ecosystem', price: '14', summary: 'Best for macOS/iMessage/Notes/Reminders workflows.' },
-    'all-access': { name: 'All Access Pass', price: '49', summary: 'All packs plus future pack updates.' },
-  };
-  const params = new URLSearchParams(location.search);
-  const pack = params.get('pack') || 'all-access';
-  const product = PRODUCTS[pack] || PRODUCTS['all-access'];
-  document.getElementById('productName').textContent = product.name;
-  document.getElementById('productSummary').textContent = product.summary;
-  document.getElementById('productPrice').textContent = `Price: $${product.price}`;
-  const title = `Order request: ${product.name} ($${product.price})`;
-  const body = `I want to buy ${product.name} for $${product.price}. Please send the payment/invoice and delivery details.
-
-Note: I will not post private payment info here.`;
-  document.getElementById('issueLink').href = `https://github.com/Dennis-Gireesh/automations-store/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
-  </script>
+  <footer class="site-footer">
+    <div class="container footer-row"><p>HermesPacks</p><a href="proof.html">Proof and test scope</a></div>
+  </footer>
 </body>
 </html>

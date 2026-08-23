@@ -1,84 +1,45 @@
-// HermesPacks storefront interactions
-// Keep content visible by default. Animations must never hide product cards if IntersectionObserver fails.
-
-// Smooth scroll for in-page anchor links
-document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-  anchor.addEventListener('click', function (e) {
-    const selector = this.getAttribute('href');
-    const target = selector && document.querySelector(selector);
-    if (!target) return;
-    e.preventDefault();
-    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  });
+const PRODUCT = Object.freeze({
+  slug: 'hermes-hybrid-operator-kit',
+  price: 12,
+  checkoutUrl: '',
+  status: 'pending'
 });
 
-// Header scroll effect
-const header = document.querySelector('.header');
-if (header) {
-  window.addEventListener('scroll', () => {
-    header.style.boxShadow = window.pageYOffset > 100
-      ? '0 4px 20px rgba(0,0,0,0.3)'
-      : 'none';
-  }, { passive: true });
-}
-
-// Progressive enhancement: fade content in only by adding classes, never by hiding inline.
-const revealTargets = document.querySelectorAll('.product-card, .step-card, .faq-item, .testimonial-card');
-revealTargets.forEach(el => el.classList.add('is-visible'));
-
-if ('IntersectionObserver' in window) {
-  const observer = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        entry.target.classList.add('is-visible');
-        observer.unobserve(entry.target);
-      }
-    });
-  }, { threshold: 0.05, rootMargin: '0px 0px -40px 0px' });
-
-  revealTargets.forEach(el => observer.observe(el));
-}
-
-// All Access hover glow
-const allAccessCard = document.querySelector('.all-access');
-if (allAccessCard) {
-  allAccessCard.addEventListener('mouseenter', () => {
-    allAccessCard.style.boxShadow = '0 0 40px rgba(245, 158, 11, 0.3)';
-  });
-  allAccessCard.addEventListener('mouseleave', () => {
-    allAccessCard.style.boxShadow = '';
-  });
-}
-
-// Button ripple effect
-const rippleStyle = document.createElement('style');
-rippleStyle.textContent = `
-  .btn { position: relative; overflow: hidden; }
-  .btn .ripple {
-    position: absolute;
-    border-radius: 50%;
-    transform: scale(0);
-    animation: hp-ripple 0.6s ease-out;
-    background: rgba(255,255,255,0.3);
-    pointer-events: none;
+const isGumroadProductUrl = (value) => {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:'
+      && (url.hostname === 'gumroad.com' || url.hostname.endsWith('.gumroad.com'));
+  } catch {
+    return false;
   }
-  @keyframes hp-ripple { to { transform: scale(2); opacity: 0; } }
-`;
-document.head.appendChild(rippleStyle);
+};
 
-document.querySelectorAll('.btn').forEach(button => {
-  button.addEventListener('click', function(e) {
-    const rect = this.getBoundingClientRect();
-    const size = Math.max(rect.width, rect.height);
-    const ripple = document.createElement('span');
-    ripple.className = 'ripple';
-    ripple.style.width = `${size}px`;
-    ripple.style.height = `${size}px`;
-    ripple.style.left = `${e.clientX - rect.left - size / 2}px`;
-    ripple.style.top = `${e.clientY - rect.top - size / 2}px`;
-    this.appendChild(ripple);
-    setTimeout(() => ripple.remove(), 650);
-  });
+const checkoutIsOpen = isGumroadProductUrl(PRODUCT.checkoutUrl);
+
+document.querySelectorAll('[data-checkout-cta]').forEach((cta) => {
+  if (checkoutIsOpen) {
+    cta.href = PRODUCT.checkoutUrl;
+    cta.textContent = `Buy for $${PRODUCT.price}`;
+  } else {
+    cta.href = 'order.html';
+    cta.textContent = 'Checkout setup status';
+  }
 });
 
-console.log('HermesPacks storefront loaded');
+document.querySelectorAll('[data-checkout-message]').forEach((message) => {
+  message.textContent = checkoutIsOpen
+    ? `Checkout status: open for $${PRODUCT.price}.`
+    : 'Checkout status: pending.';
+});
+
+const navToggle = document.querySelector('.nav-toggle');
+const navigation = document.querySelector('.site-nav');
+
+if (navToggle && navigation) {
+  navToggle.addEventListener('click', () => {
+    const expanded = navToggle.getAttribute('aria-expanded') === 'true';
+    navToggle.setAttribute('aria-expanded', String(!expanded));
+    navigation.classList.toggle('is-open', !expanded);
+  });
+}
