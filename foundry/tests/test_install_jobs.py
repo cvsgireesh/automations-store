@@ -13,10 +13,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from foundry.install_jobs import (
     ReconciliationError,
     desired_jobs,
+    install_assets,
     load_existing_jobs,
     plan_reconcile,
     run_installer,
@@ -45,7 +47,13 @@ def persisted(job, job_id: str) -> dict:
         "provider": job.provider or None,
         "model": job.model or None,
         "reasoning_effort": job.reasoning_effort or None,
-        "continuity": False,
+        # These are the fields Hermes persists for an active recurring job.
+        "enabled": True,
+        "state": "scheduled",
+        "repeat": {"times": None, "completed": 0},
+        "base_url": None,
+        "context_from": None,
+        # Hermes omits attach_to_session when it was never opted in.
     }
 
 
@@ -173,6 +181,49 @@ class InstallerPlanningTests(unittest.TestCase):
         self.assertIn("", command)
         self.assertIn("--agent", command)
 
+    def test_actual_context_from_self_is_continuity_and_is_cleared_by_an_exact_update(self):
+        job = desired_jobs(ROOT)[1]
+        existing = persisted(job, "scout-id")
+        existing["context_from"] = ["self"]
+        actions = plan_reconcile([existing], (job,))
+        self.assertEqual([(action.kind, action.job_id) for action in actions], [("update", "scout-id")])
+        self.assertIn("--no-continuity", actions[0].command("hermes", "default"))
+
+    def test_unmanaged_context_base_url_and_session_attachment_fail_closed_before_mutation(self):
+        job = desired_jobs(ROOT)[1]
+        for field, value in (
+            ("context_from", ["other-job"]),
+            ("base_url", "https://example.invalid/v1"),
+            ("attach_to_session", True),
+        ):
+            with self.subTest(field=field):
+                existing = persisted(job, "scout-id")
+                existing[field] = value
+                with self.assertRaisesRegex(ReconciliationError, field):
+                    plan_reconcile([existing], (job,))
+
+    def test_repeat_and_active_state_are_reconciled_from_actual_hermes_shape(self):
+        job = desired_jobs(ROOT)[0]
+        finite = persisted(job, "collector-id")
+        finite["repeat"] = {"times": 3, "completed": 1}
+        actions = plan_reconcile([finite], (job,))
+        self.assertEqual([action.kind for action in actions], ["update"])
+        self.assertIn("--repeat", actions[0].command("hermes", "default"))
+        self.assertIn("0", actions[0].command("hermes", "default"))
+
+        paused = persisted(job, "collector-id")
+        paused["enabled"] = False
+        paused["state"] = "paused"
+        actions = plan_reconcile([paused], (job,))
+        self.assertEqual([action.kind for action in actions], ["resume"])
+        self.assertEqual(actions[0].command("hermes", "default"), ["hermes", "-p", "default", "cron", "resume", "collector-id"])
+
+        stale_pause = persisted(job, "collector-id")
+        stale_pause["paused_at"] = "2026-08-23T00:00:00-05:00"
+        stale_pause["paused_reason"] = "old maintenance window"
+        actions = plan_reconcile([stale_pause], (job,))
+        self.assertEqual([action.kind for action in actions], ["resume"])
+
     def test_duplicate_exact_names_fail_closed(self):
         job = desired_jobs(ROOT)[0]
         duplicate = [persisted(job, "one"), persisted(job, "two")]
@@ -198,6 +249,16 @@ class InstallerExecutionTests(unittest.TestCase):
             with self.assertRaises(ReconciliationError):
                 load_existing_jobs(hermes_home)
 
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            hermes_home = base / ".hermes"
+            outside = base / "outside-cron"
+            hermes_home.mkdir()
+            outside.mkdir()
+            (hermes_home / "cron").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(ReconciliationError):
+                load_existing_jobs(hermes_home)
+
     def test_dry_run_performs_zero_writes_copies_or_scheduler_calls(self):
         with tempfile.TemporaryDirectory() as directory:
             hermes_home = Path(directory) / ".hermes"
@@ -206,7 +267,7 @@ class InstallerExecutionTests(unittest.TestCase):
                 ROOT,
                 hermes_home=hermes_home,
                 dry_run=True,
-                runner=lambda command: commands.append(command),
+                runner=lambda command, environment: commands.append(command),
             )
             self.assertEqual([action.kind for action in actions], ["create", "create", "create", "create"])
             self.assertEqual(commands, [])
@@ -219,11 +280,11 @@ class InstallerExecutionTests(unittest.TestCase):
             actions = run_installer(
                 ROOT,
                 hermes_home=hermes_home,
-                runner=lambda command: commands.append(command),
+                runner=lambda command, environment: commands.append(command),
             )
             self.assertEqual([action.kind for action in actions], ["create", "create", "create", "create"])
             self.assertEqual(len(commands), 4)
-            self.assertTrue(all(command[:3] == ["hermes", "cron", "create"] for command in commands))
+            self.assertTrue(all(command[:5] == ["hermes", "-p", "default", "cron", "create"] for command in commands))
             for name in (
                 "product_foundry_collect.py",
                 "product_foundry_monitor.py",
@@ -239,13 +300,141 @@ class InstallerExecutionTests(unittest.TestCase):
                 (ROOT / "foundry" / "skill" / "SKILL.md").read_bytes(),
             )
 
+    def test_scheduler_mutations_bind_the_planned_home_and_explicit_default_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hermes_home = Path(directory) / ".hermes"
+            calls: list[tuple[list[str], dict[str, str]]] = []
+
+            def runner(command, environment):
+                calls.append((command, environment))
+
+            run_installer(ROOT, hermes_home=hermes_home, runner=runner)
+            self.assertEqual(len(calls), 4)
+            for command, environment in calls:
+                self.assertEqual(command[:4], ["hermes", "-p", "default", "cron"])
+                self.assertEqual(environment["HERMES_HOME"], str(hermes_home))
+
+    def test_scheduler_mutations_infer_and_pin_a_named_profile_from_its_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hermes_home = Path(directory) / ".hermes" / "profiles" / "foundry"
+            hermes_home.mkdir(parents=True)
+            calls: list[tuple[list[str], dict[str, str]]] = []
+
+            def runner(command, environment):
+                calls.append((command, environment))
+
+            run_installer(ROOT, hermes_home=hermes_home, runner=runner)
+            self.assertEqual(calls[0][0][:4], ["hermes", "-p", "foundry", "cron"])
+            self.assertEqual(calls[0][1]["HERMES_HOME"], str(hermes_home))
+
+    def test_update_and_resume_mutations_also_receive_the_pinned_home_and_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hermes_home = Path(directory) / ".hermes"
+            jobs = [persisted(job, f"job-{index}") for index, job in enumerate(desired_jobs(ROOT))]
+            jobs[0]["enabled"] = False
+            jobs[0]["state"] = "paused"
+            jobs[1]["model"] = "wrong-model"
+            jobs_path = hermes_home / "cron" / "jobs.json"
+            jobs_path.parent.mkdir(parents=True)
+            jobs_path.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+            calls: list[tuple[list[str], dict[str, str]]] = []
+
+            def runner(command, environment):
+                calls.append((command, environment))
+
+            actions = run_installer(ROOT, hermes_home=hermes_home, runner=runner)
+            self.assertEqual([action.kind for action in actions], ["resume", "update"])
+            self.assertEqual([command[4] for command, _ in calls], ["resume", "edit"])
+            for command, environment in calls:
+                self.assertEqual(command[:4], ["hermes", "-p", "default", "cron"])
+                self.assertEqual(environment["HERMES_HOME"], str(hermes_home))
+
+    def test_missing_named_profile_fails_before_assets_or_scheduler_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hermes_home = Path(directory) / ".hermes" / "profiles" / "missing"
+            calls: list[tuple[list[str], dict[str, str]]] = []
+            with self.assertRaises(ReconciliationError):
+                run_installer(
+                    ROOT,
+                    hermes_home=hermes_home,
+                    runner=lambda command, environment: calls.append((command, environment)),
+                )
+            self.assertEqual(calls, [])
+            self.assertFalse(hermes_home.exists())
+
+    def test_asset_install_rejects_symlinked_parent_and_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            hermes_home = base / ".hermes"
+            outside = base / "outside"
+            outside.mkdir()
+            hermes_home.mkdir()
+            (hermes_home / "scripts").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ReconciliationError, "symlink"):
+                install_assets(ROOT, hermes_home)
+            self.assertFalse(any(outside.iterdir()))
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / ".hermes").mkdir()
+            outside = base / "outside-profiles"
+            outside.mkdir()
+            (base / ".hermes" / "profiles").symlink_to(outside, target_is_directory=True)
+            hermes_home = base / ".hermes" / "profiles" / "foundry"
+            with self.assertRaisesRegex(ReconciliationError, "symlink"):
+                install_assets(ROOT, hermes_home)
+            self.assertFalse(any(outside.iterdir()))
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            hermes_home = base / ".hermes"
+            outside = base / "outside-home"
+            outside.mkdir()
+            hermes_home.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ReconciliationError, "symlink"):
+                install_assets(ROOT, hermes_home)
+            self.assertFalse(any(outside.iterdir()))
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            hermes_home = base / ".hermes"
+            scripts = hermes_home / "scripts"
+            scripts.mkdir(parents=True)
+            target = base / "asset-target"
+            target.write_bytes((ROOT / "foundry" / "scripts" / "product_foundry_collect.py").read_bytes())
+            (scripts / "product_foundry_collect.py").symlink_to(target)
+            with self.assertRaisesRegex(ReconciliationError, "symlink"):
+                install_assets(ROOT, hermes_home)
+            self.assertTrue((scripts / "product_foundry_collect.py").is_symlink())
+            self.assertEqual(target.read_bytes(), (ROOT / "foundry" / "scripts" / "product_foundry_collect.py").read_bytes())
+
+    def test_asset_install_repairs_requested_mode_for_identical_bytes_and_rejects_reparse_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hermes_home = Path(directory) / ".hermes"
+            scripts = hermes_home / "scripts"
+            scripts.mkdir(parents=True)
+            destination = scripts / "product_foundry_collect.py"
+            destination.write_bytes((ROOT / "foundry" / "scripts" / "product_foundry_collect.py").read_bytes())
+            destination.chmod(0o600)
+            install_assets(ROOT, hermes_home)
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+
+        with tempfile.TemporaryDirectory() as directory:
+            hermes_home = Path(directory) / ".hermes"
+            with mock.patch(
+                "foundry.install_jobs._is_reparse_point",
+                side_effect=lambda path, *_: path == hermes_home,
+            ):
+                with self.assertRaisesRegex(ReconciliationError, "reparse"):
+                    install_assets(ROOT, hermes_home)
+
     def test_copied_monitor_wrapper_resolves_repo_root_from_foundry_workdir(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary_root = Path(directory) / "repository"
             (temporary_root / "foundry").mkdir(parents=True)
             shutil.copytree(ROOT / "foundry" / "src", temporary_root / "foundry" / "src")
             hermes_home = Path(directory) / ".hermes"
-            run_installer(ROOT, hermes_home=hermes_home, runner=lambda command: None)
+            run_installer(ROOT, hermes_home=hermes_home, runner=lambda command, environment: None)
             completed = subprocess.run(
                 [sys.executable, str(hermes_home / "scripts" / "product_foundry_monitor.py")],
                 cwd=temporary_root / "foundry",

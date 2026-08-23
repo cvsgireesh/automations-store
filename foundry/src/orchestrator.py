@@ -17,15 +17,18 @@ import os
 from pathlib import Path
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 from typing import Any, Iterator, Mapping, Sequence
+import uuid
 from zoneinfo import ZoneInfo
 
 import fcntl
 
 from .collector import collect
+from .audits import audit_text, audit_tree
 from .gate import evaluate
 from .models import Candidate, Signal
 from .packager import PackagingError, build_release
@@ -48,6 +51,10 @@ MAC_PRODUCT_SUITE = "Mac product suite"
 WINDOWS_COMPATIBILITY_CANARY = "Windows native compatibility canary (no Windows live Hermes readiness)"
 NO_WINDOWS_EVIDENCE = "no Windows native compatibility evidence for this source tree"
 NO_WINDOWS_LIVE_READINESS = "no Windows live Hermes readiness"
+# A successful collection refreshes its timestamps daily.  A failed collection
+# leaves those timestamps untouched, and candidates may use evidence at most
+# this many Chicago calendar days old.
+MAX_SIGNAL_AGE_DAYS = 14
 
 
 class FoundryError(RuntimeError):
@@ -145,6 +152,29 @@ def atomic_write_json(destination: str | Path, payload: Any) -> None:
         ) as temporary:
             temporary_path = Path(temporary.name)
             temporary.write(_canonical_json(payload))
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, target)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def atomic_write_bytes(destination: str | Path, content: bytes) -> None:
+    """Persist bytes with a sibling temporary file and one atomic replace."""
+    target = Path(destination)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
             temporary.flush()
             os.fsync(temporary.fileno())
         os.replace(temporary_path, target)
@@ -274,12 +304,16 @@ def collect_signals(repo_root: str | Path, observed_date: str | None = None, *,
     with state_lock(root):
         previous = _latest_signals_unlocked(root)
         changed = monitor_payload(previous) != monitor_payload(collected)
+        # The monitor's meaningful bytes deliberately exclude fetch dates, but
+        # a successful bounded collection still refreshes last-good freshness.
+        # This permits daily no-op runs to remain silent without eventually
+        # treating verified, unchanged signals as stale.
+        payload = {
+            "observed_date": observation_date,
+            "schema_version": 1,
+            "signals": [_signal_mapping(signal) for signal in collected],
+        }
         if changed:
-            payload = {
-                "observed_date": observation_date,
-                "schema_version": 1,
-                "signals": [_signal_mapping(signal) for signal in collected],
-            }
             atomic_write_json(_state_root(root) / SIGNALS_FILE, payload)
             _write_run_report(
                 root,
@@ -287,6 +321,8 @@ def collect_signals(repo_root: str | Path, observed_date: str | None = None, *,
                 "collect.json",
                 {"signal_count": len(collected), "status": "collected"},
             )
+        else:
+            atomic_write_json(_state_root(root) / SIGNALS_FILE, payload)
     return {
         "changed": changed,
         "signal_count": len(collected),
@@ -345,7 +381,7 @@ def _candidate_path(repo_root: Path) -> Path:
 
 
 def stage_candidate(repo_root: str | Path, payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Stage exactly one distinct Scout candidate per America/Chicago day."""
+    """Stage one candidate, retaining unbuilt work until it is retired."""
     root = _repo_root(repo_root)
     candidate = validate_candidate(payload)
     digest = candidate_sha256(candidate)
@@ -354,11 +390,12 @@ def stage_candidate(repo_root: str | Path, payload: Mapping[str, Any]) -> dict[s
         existing = _read_json(_candidate_path(root))
         if isinstance(existing, Mapping):
             previous_digest = existing.get("candidate_sha256")
-            previous_date = existing.get("staged_date")
             if previous_digest == digest:
                 return {"candidate_sha256": digest, "status": "noop"}
-            if previous_date == today:
-                raise CandidateError("a distinct candidate is already staged for today")
+            if not isinstance(previous_digest, str) or not previous_digest:
+                raise CandidateError("staged candidate state lacks a safe identity")
+            if not _has_successful_candidate_unlocked(root, previous_digest):
+                raise CandidateError("a distinct candidate is already staged and unbuilt")
         atomic_write_json(
             _candidate_path(root),
             {
@@ -410,6 +447,27 @@ def _load_regular_candidate_file(candidate_path: Path) -> tuple[dict[str, Any], 
     return dict(payload), identity
 
 
+def _claim_scout_proposal(proposal: Path) -> Path:
+    """Atomically move the one approved proposal aside before consuming it.
+
+    ``os.replace`` moves a symlink itself rather than following it.  The
+    subsequent no-follow regular-file read therefore rejects a swap safely,
+    while a new Scout proposal written at the original lexical path survives.
+    """
+    try:
+        before = proposal.lstat()
+    except OSError as error:
+        raise CandidateError(f"cannot read candidate JSON: {proposal}") from error
+    if not stat.S_ISREG(before.st_mode):
+        raise CandidateError("Scout proposal must be a regular file, not a symlink or special file")
+    claimed = proposal.with_name(f".{proposal.name}.claim-{uuid.uuid4().hex}")
+    try:
+        os.replace(proposal, claimed)
+    except OSError as error:
+        raise CandidateError("Scout proposal could not be claimed atomically") from error
+    return claimed
+
+
 def stage_candidate_file(repo_root: str | Path, candidate_path: str | Path, *, consume: bool = False) -> dict[str, Any]:
     """Stage a JSON candidate and consume only the one approved Scout proposal.
 
@@ -423,25 +481,34 @@ def stage_candidate_file(repo_root: str | Path, candidate_path: str | Path, *, c
     approved_proposal = _lexical_absolute(_state_root(root) / SCOUT_PROPOSAL_FILE)
     if consume and proposal != approved_proposal:
         raise CandidateError("only the approved ignored Scout proposal path may be consumed")
-    if consume:
-        candidate, identity = _load_regular_candidate_file(proposal)
-    else:
-        candidate = _load_candidate_file(proposal)
-        identity = None
-    result = stage_candidate(root, candidate)
-    if consume:
+    if not consume:
+        return stage_candidate(root, _load_candidate_file(proposal))
+
+    claimed = _claim_scout_proposal(proposal)
+    try:
+        candidate, identity = _load_regular_candidate_file(claimed)
+        result = stage_candidate(root, candidate)
         try:
-            current = proposal.lstat()
+            current = claimed.lstat()
             if (
-                identity is None
-                or not stat.S_ISREG(current.st_mode)
+                not stat.S_ISREG(current.st_mode)
                 or (current.st_dev, current.st_ino) != identity
             ):
                 raise CandidateError("Scout proposal changed before it could be consumed")
-            proposal.unlink()
+            claimed.unlink()
         except FileNotFoundError as error:
             raise CandidateError("Scout proposal disappeared before it could be consumed") from error
-    return result
+        return result
+    except Exception:
+        # Preserve the original handoff if nothing newer has appeared at the
+        # approved path.  If a newer proposal exists, never replace or delete
+        # it; the claimed file remains for explicit recovery instead.
+        try:
+            proposal.lstat()
+        except FileNotFoundError:
+            if claimed.exists() or claimed.is_symlink():
+                os.replace(claimed, proposal)
+        raise
 
 
 def _ledger_unlocked(repo_root: Path) -> list[dict[str, Any]]:
@@ -473,11 +540,29 @@ def _has_successful_release_unlocked(repo_root: Path, candidate_digest: str, ver
     )
 
 
+def _has_successful_candidate_unlocked(repo_root: Path, candidate_digest: str) -> bool:
+    return any(
+        release.get("status") == "success" and release.get("candidate_sha256") == candidate_digest
+        for release in _ledger_unlocked(repo_root)
+    )
+
+
+def _has_successful_slug_version_unlocked(repo_root: Path, slug: str, version: str) -> bool:
+    return any(
+        release.get("status") == "success"
+        and release.get("slug") == slug
+        and release.get("version") == version
+        for release in _ledger_unlocked(repo_root)
+    )
+
+
 def _append_success_unlocked(repo_root: Path, candidate_digest: str, slug: str, version: str,
                              archive_sha256: str | None = None) -> None:
     releases = _ledger_unlocked(repo_root)
     if _has_successful_release_unlocked(repo_root, candidate_digest, version):
         return
+    if _has_successful_slug_version_unlocked(repo_root, slug, version):
+        raise ReleaseError("a different candidate already owns this successful slug/version")
     release = {
         "candidate_sha256": candidate_digest,
         "date": chicago_date(),
@@ -516,7 +601,11 @@ def _new_sku_gate(candidate: Mapping[str, Any], signals: Sequence[Signal], ledge
     return decision.passed, list(decision.reasons), list(decision.matched_signal_ids)
 
 
-def _update_gate(candidate: Mapping[str, Any], signals: Sequence[Signal]) -> tuple[bool, list[str], list[str]]:
+def _update_gate(candidate: Mapping[str, Any], signals: Sequence[Signal],
+                 released_slugs: set[str]) -> tuple[bool, list[str], list[str]]:
+    if candidate["slug"] not in released_slugs:
+        _, reasons, matched_ids = _new_sku_gate(candidate, signals, released_slugs)
+        return False, ["update_requires_existing_successful_release", *reasons], matched_ids
     cited = {signal_id for signal_id in candidate["signal_ids"]}
     matched = [signal for signal in signals if signal.signal_id in cited]
     matched_ids = [signal.signal_id for signal in matched]
@@ -539,6 +628,31 @@ def _update_gate(candidate: Mapping[str, Any], signals: Sequence[Signal]) -> tup
     return not reasons, reasons, matched_ids
 
 
+def _signal_observation_date(signal: Signal) -> date | None:
+    try:
+        observed = datetime.fromisoformat(signal.observed_at.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+    if observed.tzinfo is None:
+        return None
+    return observed.astimezone(CHICAGO).date()
+
+
+def _stale_signal_ids(candidate: Mapping[str, Any], signals: Sequence[Signal], as_of: str) -> list[str]:
+    """Return cited evidence that is malformed, future-dated, or beyond TTL."""
+    today = date.fromisoformat(as_of)
+    cited = set(candidate["signal_ids"])
+    stale: list[str] = []
+    for signal in signals:
+        if signal.signal_id not in cited:
+            continue
+        observed_date = _signal_observation_date(signal)
+        age = (today - observed_date).days if observed_date is not None else None
+        if age is None or age < 0 or age > MAX_SIGNAL_AGE_DAYS:
+            stale.append(signal.signal_id)
+    return stale
+
+
 def _remove_stale_gate_unlocked(repo_root: Path) -> None:
     try:
         (_state_root(repo_root) / GATE_FILE).unlink()
@@ -546,25 +660,35 @@ def _remove_stale_gate_unlocked(repo_root: Path) -> None:
         pass
 
 
-def gate_candidate(repo_root: str | Path, payload: Mapping[str, Any]) -> dict[str, Any]:
+def gate_candidate(repo_root: str | Path, payload: Mapping[str, Any], *,
+                   as_of_date: str | None = None) -> dict[str, Any]:
     """Evaluate a candidate and persist a gate artifact only when it passes."""
     root = _repo_root(repo_root)
     candidate = validate_candidate(payload)
     digest = candidate_sha256(candidate)
+    generated_date = _validated_date(as_of_date)
     with state_lock(root):
         signals = _latest_signals_unlocked(root)
-        if candidate["candidate_type"] == NEW_SKU:
-            passed, reasons, matched_ids = _new_sku_gate(candidate, signals, _released_slugs_unlocked(root))
+        released_slugs = _released_slugs_unlocked(root)
+        if _has_successful_candidate_unlocked(root, digest):
+            passed, reasons, matched_ids = False, ["candidate_already_successfully_released"], []
+        elif candidate["candidate_type"] == NEW_SKU:
+            passed, reasons, matched_ids = _new_sku_gate(candidate, signals, released_slugs)
         else:
-            passed, reasons, matched_ids = _update_gate(candidate, signals)
+            passed, reasons, matched_ids = _update_gate(candidate, signals, released_slugs)
+        stale_signal_ids = _stale_signal_ids(candidate, signals, generated_date)
+        if stale_signal_ids:
+            passed = False
+            reasons = [*reasons, "stale_signal_evidence"]
         result = {
             "candidate": candidate,
             "candidate_sha256": digest,
             "candidate_type": candidate["candidate_type"],
-            "generated_date": chicago_date(),
+            "generated_date": generated_date,
             "matched_signal_ids": matched_ids,
             "passed": passed,
             "reasons": reasons,
+            "stale_signal_ids": stale_signal_ids,
         }
         if passed:
             atomic_write_json(_state_root(root) / GATE_FILE, result)
@@ -583,6 +707,11 @@ def gate_current_candidate(repo_root: str | Path) -> dict[str, Any] | None:
         if not isinstance(staged, Mapping) or not isinstance(staged.get("candidate"), Mapping):
             raise CandidateError("staged candidate state is invalid")
         candidate = dict(staged["candidate"])
+        digest = staged.get("candidate_sha256")
+        if isinstance(digest, str) and _has_successful_candidate_unlocked(root, digest):
+            _candidate_path(root).unlink(missing_ok=True)
+            _remove_stale_gate_unlocked(root)
+            return None
     return gate_candidate(root, candidate)
 
 
@@ -626,16 +755,164 @@ def source_tree_revision(source: str | Path) -> str:
     commit is never used as ``source_revision``.  The deterministic tree
     digest is the source identity that goes into the archive manifest.
     """
-    source_root = Path(source).resolve()
-    if not source_root.is_dir() or source_root.is_symlink():
+    source_root = Path(source)
+    try:
+        root_stat = source_root.lstat()
+    except OSError as error:
+        raise ReleaseError("source tree for revision hashing is unavailable") from error
+    if source_root.is_symlink() or not stat.S_ISDIR(root_stat.st_mode):
         raise ReleaseError("source tree for revision hashing is unavailable")
+    source_root = source_root.resolve()
+
+    files: list[Path] = []
+    for current, directories, filenames in os.walk(source_root, followlinks=False):
+        current_path = Path(current)
+        for directory in directories:
+            directory_path = current_path / directory
+            try:
+                directory_stat = directory_path.lstat()
+            except OSError as error:
+                raise ReleaseError("source tree changed while being hashed") from error
+            if directory_path.is_symlink() or not stat.S_ISDIR(directory_stat.st_mode):
+                raise ReleaseError("source tree contains a link or non-directory entry")
+        for filename in filenames:
+            file_path = current_path / filename
+            try:
+                file_stat = file_path.lstat()
+            except OSError as error:
+                raise ReleaseError("source tree changed while being hashed") from error
+            if file_path.is_symlink() or not stat.S_ISREG(file_stat.st_mode):
+                raise ReleaseError("source tree contains a link or non-regular file")
+            files.append(file_path)
+
     digest = hashlib.sha256()
-    for path in sorted(item for item in source_root.rglob("*") if item.is_file() and not item.is_symlink()):
-        digest.update(path.relative_to(source_root).as_posix().encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
+    digest.update(b"hermes-source-tree-v2\0")
+    for path in sorted(files):
+        relative_path = path.relative_to(source_root).as_posix().encode("utf-8")
+        try:
+            content = path.read_bytes()
+        except OSError as error:
+            raise ReleaseError("source tree changed while being hashed") from error
+        # Each entry has its own digest and all variable-length values are
+        # length-prefixed.  A NUL in a filename's content can never blur the
+        # boundary between the current file and the next file.
+        file_digest = hashlib.sha256()
+        file_digest.update(struct.pack(">Q", len(relative_path)))
+        file_digest.update(relative_path)
+        file_digest.update(struct.pack(">Q", len(content)))
+        file_digest.update(content)
+        digest.update(struct.pack(">Q", len(relative_path)))
+        digest.update(relative_path)
+        digest.update(file_digest.digest())
     return f"tree-sha256:{digest.hexdigest()}"
+
+
+def _private_product_source(repo_root: Path, slug: str) -> Path:
+    """Return a lexical private-product directory without following links.
+
+    ``package_release`` treats the ignored ``private-products`` directory as
+    the security boundary for paid source.  Checking only the final product
+    path is insufficient: a linked ``private-products`` parent would make the
+    snapshotter execute files outside that boundary.  Keep this check lexical
+    so the final component is never resolved as part of validation.
+    """
+    private_products = repo_root / "private-products"
+    source = private_products / slug
+    for path, label in ((private_products, "private-products"), (source, "private product source")):
+        try:
+            entry = path.lstat()
+        except OSError as error:
+            raise ReleaseError(f"{label} is unavailable") from error
+        if path.is_symlink() or not stat.S_ISDIR(entry.st_mode):
+            raise ReleaseError(f"{label} must be a regular directory, not a link")
+    return source
+
+
+def _snapshot_source_tree(source: Path, destination: Path) -> None:
+    """Copy a regular-file source tree without ever following source links."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+
+    def open_directory(path: Path | str, *, directory_fd: int | None = None) -> int:
+        try:
+            descriptor = os.open(path, flags | directory_flag, dir_fd=directory_fd)
+        except OSError as error:
+            raise ReleaseError("private product source contains an unreadable or linked directory") from error
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
+            os.close(descriptor)
+            raise ReleaseError("private product source contains a non-directory entry")
+        return descriptor
+
+    def copy_regular_file(name: str, source_fd: int, target: Path) -> None:
+        try:
+            descriptor = os.open(name, flags, dir_fd=source_fd)
+        except OSError as error:
+            raise ReleaseError("private product source contains an unreadable or linked file") from error
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ReleaseError("private product source contains a non-regular file")
+            with os.fdopen(descriptor, "rb", closefd=True) as source_file:
+                descriptor = -1
+                with target.open("xb") as destination_file:
+                    while chunk := source_file.read(1024 * 1024):
+                        destination_file.write(chunk)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def copy_directory(source_fd: int, target: Path) -> None:
+        try:
+            entries = sorted(list(os.scandir(source_fd)), key=lambda entry: entry.name)
+            for entry in entries:
+                try:
+                    entry_stat = os.stat(entry.name, dir_fd=source_fd, follow_symlinks=False)
+                except OSError as error:
+                    raise ReleaseError("private product source changed while snapshotting") from error
+                if stat.S_ISLNK(entry_stat.st_mode):
+                    raise ReleaseError("private product source contains a symlink")
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    child_target = target / entry.name
+                    child_target.mkdir()
+                    child_fd = open_directory(entry.name, directory_fd=source_fd)
+                    try:
+                        copy_directory(child_fd, child_target)
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(entry_stat.st_mode):
+                    copy_regular_file(entry.name, source_fd, target / entry.name)
+                else:
+                    raise ReleaseError("private product source contains a non-regular file")
+        except OSError as error:
+            raise ReleaseError("private product source changed while snapshotting") from error
+
+    try:
+        source_stat = source.lstat()
+    except OSError as error:
+        raise ReleaseError("private product source is unavailable") from error
+    if source.is_symlink() or not stat.S_ISDIR(source_stat.st_mode):
+        raise ReleaseError("private product source is unavailable")
+    destination.mkdir(parents=True)
+    source_fd = open_directory(source)
+    try:
+        copy_directory(source_fd, destination)
+    finally:
+        os.close(source_fd)
+
+
+def _snapshot_file_hashes(source: Path) -> dict[str, str]:
+    """Return release-member file hashes for a previously safe snapshot."""
+    root = source.resolve()
+    hashes: dict[str, str] = {}
+    for current, _, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for filename in filenames:
+            path = current_path / filename
+            if path.is_symlink() or not path.is_file():
+                raise ReleaseError("snapshot contains a linked or invalid file")
+            hashes[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return dict(sorted(hashes.items()))
 
 
 def _build_control_revision(repo_root: Path) -> str | None:
@@ -690,7 +967,9 @@ def _run_product_tests(repo_root: Path, slug: str) -> tuple[str, str]:
     return command, hashlib.sha256(output).hexdigest()
 
 
-def _release_metadata(repo_root: Path, source: Path, public_metadata: Mapping[str, Any], slug: str) -> dict[str, Any]:
+def _release_metadata(repo_root: Path, snapshot_root: Path, source: Path,
+                      public_metadata: Mapping[str, Any], slug: str,
+                      source_revision: str) -> dict[str, Any]:
     version_file = source / "VERSION"
     if not version_file.is_file():
         raise ReleaseError("private product VERSION file is required")
@@ -698,8 +977,9 @@ def _release_metadata(repo_root: Path, source: Path, public_metadata: Mapping[st
     if source_version != public_metadata["version"]:
         raise ReleaseError("private VERSION does not match public product metadata")
     update_end = date.fromisoformat(chicago_date()) + timedelta(days=30)
-    test_command, output_sha256 = _run_product_tests(repo_root, slug)
-    source_revision = source_tree_revision(source)
+    test_command, output_sha256 = _run_product_tests(snapshot_root, slug)
+    if source_tree_revision(source) != source_revision:
+        raise ReleaseError("safe package snapshot changed during product tests")
     tested_platforms, tested_scope = _tested_platform_scope_unlocked(repo_root, source_revision)
     return {
         "build_control_revision": _build_control_revision(repo_root),
@@ -731,6 +1011,24 @@ def _fresh_gate_unlocked(repo_root: Path, slug: str) -> dict[str, Any]:
     return dict(gate)
 
 
+def _audit_generated_copy(payloads: Mapping[str, Mapping[str, Any]]) -> None:
+    """Apply the canonical public-claims audit before release files exist."""
+    findings = []
+    for name, payload in payloads.items():
+        findings.extend(audit_text(_canonical_json(dict(payload)).decode("ascii"), name))
+    if findings:
+        codes = ", ".join(sorted({finding.code for finding in findings}))
+        raise ReleaseError(f"generated public release copy audit failed: {codes}")
+
+
+def _retire_staged_candidate_unlocked(repo_root: Path, candidate_digest: str) -> None:
+    """Remove a fulfilled handoff so the weekly Builder monitor stays quiet."""
+    staged = _read_json(_candidate_path(repo_root))
+    if isinstance(staged, Mapping) and staged.get("candidate_sha256") == candidate_digest:
+        _candidate_path(repo_root).unlink(missing_ok=True)
+    _remove_stale_gate_unlocked(repo_root)
+
+
 def package_release(repo_root: str | Path, slug: str, version: str) -> dict[str, Any]:
     """Test, audit, package, and locally verify a fresh gated release.
 
@@ -746,57 +1044,89 @@ def package_release(repo_root: str | Path, slug: str, version: str) -> dict[str,
         candidate_digest = gate["candidate_sha256"]
         if _has_successful_release_unlocked(root, candidate_digest, version):
             return {"status": "noop"}
+        if _has_successful_slug_version_unlocked(root, slug, version):
+            raise ReleaseError("a different candidate already owns this successful slug/version")
 
         public_metadata = _read_public_metadata(root, slug, version)
-        source = root / "private-products" / slug
-        if not source.is_dir() or source.is_symlink():
-            raise ReleaseError("private product source is unavailable")
-        release_metadata = _release_metadata(root, source, public_metadata, slug)
+        source = _private_product_source(root, slug)
         archive_path = root / "dist" / "hermespacks" / f"{slug}-{version}.zip"
-        try:
-            manifest = build_release(source, archive_path, release_metadata, repo_root=root)
-        except PackagingError as error:
-            raise ReleaseError(f"package verification failed: {error}") from error
-
         manifest_path = archive_path.with_suffix(".manifest.json")
         listing_path = archive_path.with_suffix(".listing.json")
-        release_report = {
-            "archive": archive_path.name,
-            "archive_sha256": manifest.archive_sha256,
-            "build_control_revision": release_metadata["build_control_revision"],
-            "candidate_sha256": candidate_digest,
-            "checkout_status": public_metadata["checkout_status"],
-            "files": manifest.files,
-            "generated_date": chicago_date(),
-            "price_usd": public_metadata["price_usd"],
-            "publication_status": public_metadata["publication_status"],
-            "slug": slug,
-            "source_revision": manifest.source_revision,
-            "test_command": manifest.test_command,
-            "test_output_sha256": release_metadata["test_output_sha256"],
-            "tested_platforms": list(manifest.tested_platforms),
-            "tested_scope": release_metadata["tested_scope"],
-            "update_policy_end_date": manifest.update_policy_end_date,
-            "verified_revenue_usd": 0,
-            "version": version,
-            "verification_status": "verified_release_manifest",
-        }
-        listing_copy = {
-            "checkout_status": public_metadata["checkout_status"],
-            "name": public_metadata["name"],
-            "non_affiliation": public_metadata["non_affiliation"],
-            "price_usd": public_metadata["price_usd"],
-            "publication_status": public_metadata["publication_status"],
-            "slug": slug,
-            "tested_scope": release_metadata["tested_scope"],
-            "update_policy": public_metadata["update_policy"],
-            "verification_status": "verified_release_manifest",
-            "verified_revenue_usd": 0,
-            "version": version,
-        }
+
+        # The snapshot is a disposable, private-products-contained miniature
+        # repository.  The original paid source is never audited through a
+        # test process and is never reread after this copy completes.
+        with tempfile.TemporaryDirectory(prefix="hermes-foundry-package-") as temporary_directory:
+            snapshot_root = Path(temporary_directory) / "repository"
+            snapshot_source = snapshot_root / "private-products" / slug
+            _snapshot_source_tree(source, snapshot_source)
+            source_findings = audit_tree(snapshot_source)
+            if source_findings:
+                codes = ", ".join(sorted({finding.code for finding in source_findings}))
+                raise ReleaseError(f"private source snapshot audit failed: {codes}")
+            source_revision = source_tree_revision(snapshot_source)
+            release_metadata = _release_metadata(
+                root, snapshot_root, snapshot_source, public_metadata, slug, source_revision
+            )
+            snapshot_archive = snapshot_root / "dist" / "hermespacks" / archive_path.name
+            try:
+                manifest = build_release(
+                    snapshot_source, snapshot_archive, release_metadata, repo_root=snapshot_root
+                )
+            except PackagingError as error:
+                raise ReleaseError(f"package verification failed: {error}") from error
+            if source_tree_revision(snapshot_source) != source_revision:
+                raise ReleaseError("safe package snapshot changed while packaging")
+            if _snapshot_file_hashes(snapshot_source) != manifest.files:
+                raise ReleaseError("safe package snapshot bytes do not match the verified archive")
+
+            release_report = {
+                "archive": archive_path.name,
+                "archive_sha256": manifest.archive_sha256,
+                "build_control_revision": release_metadata["build_control_revision"],
+                "candidate_sha256": candidate_digest,
+                "checkout_status": public_metadata["checkout_status"],
+                "files": manifest.files,
+                "generated_date": chicago_date(),
+                "price_usd": public_metadata["price_usd"],
+                "publication_status": public_metadata["publication_status"],
+                "slug": slug,
+                "source_revision": manifest.source_revision,
+                "test_command": manifest.test_command,
+                "test_output_sha256": release_metadata["test_output_sha256"],
+                "tested_platforms": list(manifest.tested_platforms),
+                "tested_scope": release_metadata["tested_scope"],
+                "update_policy_end_date": manifest.update_policy_end_date,
+                "verified_revenue_usd": 0,
+                "version": version,
+                "verification_status": "verified_release_manifest",
+            }
+            listing_copy = {
+                "checkout_status": public_metadata["checkout_status"],
+                "name": public_metadata["name"],
+                "non_affiliation": public_metadata["non_affiliation"],
+                "price_usd": public_metadata["price_usd"],
+                "publication_status": public_metadata["publication_status"],
+                "slug": slug,
+                "tested_scope": release_metadata["tested_scope"],
+                "update_policy": public_metadata["update_policy"],
+                "verification_status": "verified_release_manifest",
+                "verified_revenue_usd": 0,
+                "version": version,
+            }
+            _audit_generated_copy({
+                "release-manifest.json": release_report,
+                "listing-copy.json": listing_copy,
+            })
+            archive_bytes = snapshot_archive.read_bytes()
+            if hashlib.sha256(archive_bytes).hexdigest() != manifest.archive_sha256:
+                raise ReleaseError("verified snapshot archive changed before installation")
+
+        atomic_write_bytes(archive_path, archive_bytes)
         atomic_write_json(manifest_path, release_report)
         atomic_write_json(listing_path, listing_copy)
         _append_success_unlocked(root, candidate_digest, slug, version, manifest.archive_sha256)
+        _retire_staged_candidate_unlocked(root, candidate_digest)
         _write_run_report(
             root,
             chicago_date(),

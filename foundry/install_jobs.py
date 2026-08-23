@@ -2,7 +2,8 @@
 
 The installer deliberately treats ``~/.hermes/cron/jobs.json`` as a read-only
 planning input.  It never edits that file directly: all scheduler mutations
-are delegated to ``hermes cron create`` or ``hermes cron edit``.
+are delegated to narrow, exact-job ``hermes cron create``, ``edit``, or
+``resume`` commands.
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +28,7 @@ SCRIPT_NAMES = (
     "product_foundry_verify.py",
 )
 SKILL_NAME = "hermes-product-foundry"
+PROFILE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 class ReconciliationError(RuntimeError):
@@ -55,17 +59,26 @@ class Job:
 
     def normalized(self) -> dict[str, Any]:
         return {
+            "attach_to_session": None,
+            "base_url": None,
+            "context_from_nonself": (),
             "deliver": self.deliver,
+            "enabled": True,
             "model": self.model,
             "monitor_script": self.monitor_script,
             "monitor_url": None,
             "no_agent": self.no_agent,
+            "paused_at": None,
+            "paused_reason": None,
             "prompt": self.prompt,
             "provider": self.provider,
             "reasoning_effort": self.reasoning_effort,
+            "repeat_configured": True,
+            "repeat_times": None,
             "schedule": self.schedule,
             "script": self.script,
             "skills": self.skills,
+            "state": "scheduled",
             "workdir": self.workdir,
             "continuity": False,
         }
@@ -73,17 +86,16 @@ class Job:
 
 @dataclass(frozen=True)
 class Action:
-    """One explicit Hermes CLI mutation, or a planned no-op-free create."""
+    """One exact-name Hermes CLI mutation planned from persisted state."""
 
     kind: str
     job: Job
     job_id: str | None = None
 
-    def command(self, hermes_bin: str = "hermes") -> list[str]:
+    def command(self, hermes_bin: str = "hermes", profile: str = "default") -> list[str]:
+        prefix = [hermes_bin, "-p", profile, "cron"]
         if self.kind == "create":
-            command = [
-                hermes_bin,
-                "cron",
+            command = prefix + [
                 "create",
                 self.job.schedule,
                 self.job.prompt,
@@ -110,11 +122,12 @@ class Action:
                 command.extend(["--reasoning-effort", self.job.reasoning_effort])
             return command
 
+        if self.kind == "resume" and self.job_id:
+            return prefix + ["resume", self.job_id]
+
         if self.kind != "update" or not self.job_id:
-            raise ReconciliationError("only create or identified update actions are executable")
-        command = [
-            hermes_bin,
-            "cron",
+            raise ReconciliationError("only identified create, update, or resume actions are executable")
+        command = prefix + [
             "edit",
             self.job_id,
             "--schedule",
@@ -125,6 +138,10 @@ class Action:
             self.job.name,
             "--deliver",
             self.job.deliver,
+            # Hermes normalizes non-positive repeat to an infinite recurring
+            # job.  Passing it explicitly clears any finite repeat budget.
+            "--repeat",
+            "0",
             "--workdir",
             self.job.workdir,
             # Hermes documents an empty value as the safe way to clear fields.
@@ -267,6 +284,48 @@ def _workdir(value: Any) -> str:
     return str(Path(text).expanduser().resolve())
 
 
+def _context_from(record: Mapping[str, Any], job_id: str | None) -> tuple[bool, tuple[str, ...]]:
+    """Return self-continuity and non-self refs from Hermes's actual shape."""
+    raw = record.get("context_from")
+    if isinstance(raw, str):
+        values: Iterable[Any] = [raw]
+    elif isinstance(raw, (list, tuple)):
+        values = raw
+    elif raw in (None, ""):
+        values = []
+    else:
+        raise ReconciliationError("managed job has malformed context_from")
+    refs = [_text(value) for value in values]
+    refs = [value for value in refs if value]
+    continuity = any(value.casefold() == "self" for value in refs)
+    nonself = tuple(value for value in refs if value.casefold() != "self")
+    return continuity, nonself
+
+
+def _repeat_shape(record: Mapping[str, Any]) -> tuple[bool, int | None]:
+    raw = record.get("repeat")
+    if not isinstance(raw, Mapping):
+        return False, None
+    value = raw.get("times")
+    if value is None:
+        return True, None
+    if isinstance(value, bool):
+        raise ReconciliationError("managed job has malformed repeat.times")
+    try:
+        return True, int(value)
+    except (TypeError, ValueError) as error:
+        raise ReconciliationError("managed job has malformed repeat.times") from error
+
+
+def _attachment_value(record: Mapping[str, Any]) -> bool | None:
+    value = record.get("attach_to_session")
+    if value in (None, False, ""):
+        return None
+    if value is True:
+        return True
+    raise ReconciliationError("managed job has malformed attach_to_session")
+
+
 def normalize_existing(record: Job | Mapping[str, Any]) -> tuple[str | None, dict[str, Any], str | None]:
     """Normalize legacy Hermes records into exactly the fields we own."""
     if isinstance(record, Job):
@@ -274,23 +333,35 @@ def normalize_existing(record: Job | Mapping[str, Any]) -> tuple[str | None, dic
     if not isinstance(record, Mapping):
         raise ReconciliationError("cron jobs.json contains a non-object job record")
     name = _text(record.get("name"))
+    job_id = _text(record.get("id"))
     provider = _text(record.get("provider")) or _text(record.get("model_provider"))
+    continuity, nonself_context = _context_from(record, job_id)
+    repeat_configured, repeat_times = _repeat_shape(record)
     normalized = {
+        "attach_to_session": _attachment_value(record),
+        "base_url": _text(record.get("base_url")),
+        "context_from_nonself": nonself_context,
         "deliver": _text(record.get("deliver")) or "local",
+        "enabled": record.get("enabled") is True,
         "model": _text(record.get("model")),
         "monitor_script": _text(record.get("monitor_script")),
         "monitor_url": _text(record.get("monitor_url")),
         "no_agent": bool(record.get("no_agent")),
+        "paused_at": _text(record.get("paused_at")),
+        "paused_reason": _text(record.get("paused_reason")),
         "prompt": _text(record.get("prompt")) or "",
         "provider": provider,
         "reasoning_effort": _text(record.get("reasoning_effort")),
+        "repeat_configured": repeat_configured,
+        "repeat_times": repeat_times,
         "schedule": _schedule(record),
         "script": _text(record.get("script")),
         "skills": _skills(record),
+        "state": _text(record.get("state")) or "",
         "workdir": _workdir(record.get("workdir")),
-        "continuity": bool(record.get("continuity")),
+        "continuity": continuity,
     }
-    return name, normalized, _text(record.get("id"))
+    return name, normalized, job_id
 
 
 def plan_reconcile(existing: Sequence[Job | Mapping[str, Any]], desired: Sequence[Job]) -> list[Action]:
@@ -315,19 +386,71 @@ def plan_reconcile(existing: Sequence[Job | Mapping[str, Any]], desired: Sequenc
             actions.append(Action("create", job))
             continue
         actual, job_id = match
-        if actual != job.normalized():
+        if actual["base_url"] is not None:
+            raise ReconciliationError(f"managed job has unsupported base_url drift: {job.name}")
+        if actual["attach_to_session"] is not None:
+            raise ReconciliationError(f"managed job has unsupported attach_to_session drift: {job.name}")
+        if actual["context_from_nonself"]:
+            raise ReconciliationError(f"managed job has unsupported context_from refs: {job.name}")
+        desired_values = job.normalized()
+        # Resume, not edit, owns Hermes's active lifecycle quartet.
+        update_fields = ("enabled", "state", "paused_at", "paused_reason")
+        needs_update = any(
+            actual[field] != desired_values[field]
+            for field in desired_values
+            if field not in update_fields
+        )
+        needs_resume = any(
+            actual[field] != desired_values[field]
+            for field in ("enabled", "state", "paused_at", "paused_reason")
+        )
+        if needs_update:
             if not job_id:
                 raise ReconciliationError(f"managed job lacks a scheduler id: {job.name}")
             actions.append(Action("update", job, job_id))
+        if needs_resume:
+            if not job_id:
+                raise ReconciliationError(f"managed job lacks a scheduler id: {job.name}")
+            actions.append(Action("resume", job, job_id))
     return actions
+
+
+def _home_ancestry(home: Path) -> tuple[Path, ...]:
+    """Return the lexical Hermes-owned directories leading to ``home``."""
+    anchor = home.parent.parent if home.parent.name == "profiles" else home
+    paths = [anchor]
+    current = anchor
+    try:
+        relative = home.relative_to(anchor)
+    except ValueError as error:
+        raise ReconciliationError("planned Hermes home has invalid ancestry") from error
+    for component in relative.parts:
+        current = current / component
+        paths.append(current)
+    return tuple(paths)
 
 
 def load_existing_jobs(hermes_home: str | Path) -> list[Mapping[str, Any]]:
     """Safely read existing jobs for planning, without repairing or writing them."""
-    jobs_path = Path(hermes_home) / "cron" / "jobs.json"
-    if not jobs_path.exists():
+    home = Path(os.path.abspath(os.fspath(Path(hermes_home).expanduser())))
+    cron_root = home / "cron"
+    for parent in (*_home_ancestry(home), cron_root):
+        try:
+            parent_stat = parent.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ReconciliationError(f"cannot inspect Hermes jobs parent: {parent}") from error
+        if parent.is_symlink() or _is_reparse_point(parent, parent_stat) or not stat.S_ISDIR(parent_stat.st_mode):
+            raise ReconciliationError("Hermes jobs parent is not a safe regular directory")
+    jobs_path = cron_root / "jobs.json"
+    try:
+        job_stat = jobs_path.lstat()
+    except FileNotFoundError:
         return []
-    if not jobs_path.is_file():
+    except OSError as error:
+        raise ReconciliationError("Hermes jobs path is unreadable") from error
+    if jobs_path.is_symlink() or _is_reparse_point(jobs_path, job_stat) or not stat.S_ISREG(job_stat.st_mode):
         raise ReconciliationError("Hermes jobs path is not a regular file")
     try:
         payload = json.loads(jobs_path.read_text(encoding="utf-8-sig"))
@@ -342,17 +465,107 @@ def load_existing_jobs(hermes_home: str | Path) -> list[Mapping[str, Any]]:
     return [dict(job) for job in jobs]
 
 
-def _atomic_copy(source: Path, destination: Path, mode: int) -> None:
-    """Copy one approved local asset atomically, skipping identical bytes."""
-    if not source.is_file():
-        raise ReconciliationError(f"installer source asset is missing: {source}")
-    content = source.read_bytes()
+def _is_reparse_point(path: Path, file_stat: os.stat_result | None = None) -> bool:
+    """Recognize Windows junctions/reparse entries without following them."""
     try:
-        if destination.is_file() and destination.read_bytes() == content:
+        details = file_stat if file_stat is not None else path.lstat()
+    except OSError:
+        return False
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(details, "st_file_attributes", 0) & flag)
+
+
+def _safe_directory_chain(home: Path, destination_parent: Path) -> None:
+    """Create only lexical descendants of home, rejecting linked ancestry."""
+    home_path = Path(os.path.abspath(os.fspath(home.expanduser())))
+    target = Path(os.path.abspath(os.fspath(destination_parent)))
+    try:
+        target.relative_to(home_path)
+    except ValueError as error:
+        raise ReconciliationError("installed asset destination escapes planned Hermes home") from error
+    # A named profile lives below <root>/profiles/<name>.  Its .hermes root
+    # and profiles directory are part of the destination ancestry too, so
+    # validate them rather than only the final profile directory.
+    anchor = home_path.parent.parent if home_path.parent.name == "profiles" else home_path
+    relative = target.relative_to(anchor)
+
+    # A named profile may be requested before its .hermes/profiles ancestry
+    # exists.  Create that lexical chain one component at a time, starting at
+    # its closest existing parent, so a planted link is inspected rather than
+    # followed by mkdir(parents=True).
+    missing: list[Path] = []
+    probe = anchor
+    while True:
+        try:
+            probe.lstat()
+            break
+        except FileNotFoundError:
+            missing.append(probe)
+            if probe.parent == probe:
+                raise ReconciliationError("planned Hermes home has no existing parent")
+            probe = probe.parent
+        except OSError as error:
+            raise ReconciliationError(f"cannot inspect installed asset parent: {probe}") from error
+
+    # Validate the first existing lexical ancestor too.  It may be a planted
+    # `.hermes` or `profiles` link; omitting it would let creation of the next
+    # component follow that link.
+    chain = [probe, *reversed(missing)]
+    current = anchor
+    for component in relative.parts:
+        current = current / component
+        chain.append(current)
+    for current in chain:
+        try:
+            details = current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir()
+                details = current.lstat()
+            except OSError as error:
+                raise ReconciliationError(f"cannot create installed asset parent: {current}") from error
+        except OSError as error:
+            raise ReconciliationError(f"cannot inspect installed asset parent: {current}") from error
+        if current.is_symlink():
+            raise ReconciliationError(f"installed asset parent is a symlink: {current}")
+        if _is_reparse_point(current, details):
+            raise ReconciliationError(f"installed asset parent is a Windows reparse point: {current}")
+        if not stat.S_ISDIR(details.st_mode):
+            raise ReconciliationError(f"installed asset parent is not a directory: {current}")
+
+
+def _atomic_copy(source: Path, destination: Path, mode: int, home: Path) -> None:
+    """Copy one approved local asset atomically through safe lexical parents."""
+    try:
+        source_stat = source.lstat()
+    except OSError as error:
+        raise ReconciliationError(f"installer source asset is missing: {source}") from error
+    if source.is_symlink():
+        raise ReconciliationError(f"installer source asset is a symlink: {source}")
+    if _is_reparse_point(source, source_stat):
+        raise ReconciliationError(f"installer source asset is a Windows reparse point: {source}")
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise ReconciliationError(f"installer source asset is not a regular file: {source}")
+    try:
+        content = source.read_bytes()
+    except OSError as error:
+        raise ReconciliationError(f"cannot read installer source asset: {source}") from error
+    _safe_directory_chain(home, destination.parent)
+    try:
+        destination_stat = destination.lstat()
+        if destination.is_symlink():
+            raise ReconciliationError(f"installed asset destination is a symlink: {destination}")
+        if _is_reparse_point(destination, destination_stat):
+            raise ReconciliationError(f"installed asset destination is a Windows reparse point: {destination}")
+        if not stat.S_ISREG(destination_stat.st_mode):
+            raise ReconciliationError(f"installed asset destination is not a regular file: {destination}")
+        if destination.read_bytes() == content:
+            os.chmod(destination, mode)
             return
+    except FileNotFoundError:
+        pass
     except OSError as error:
         raise ReconciliationError(f"cannot inspect installed asset: {destination}") from error
-    destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -379,20 +592,35 @@ def install_assets(repo_root: str | Path, hermes_home: str | Path) -> None:
     home = Path(hermes_home)
     scripts_root = root / "foundry" / "scripts"
     for script_name in SCRIPT_NAMES:
-        _atomic_copy(scripts_root / script_name, home / "scripts" / script_name, 0o700)
+        _atomic_copy(scripts_root / script_name, home / "scripts" / script_name, 0o700, home)
     _atomic_copy(
         root / "foundry" / "skill" / "SKILL.md",
-        home / "skills" / SKILL_NAME / "SKILL.md",
-        0o600,
+        home / "skills" / SKILL_NAME / "SKILL.md", 0o600, home,
     )
 
 
-Runner = Callable[[list[str]], Any]
-
-
-def _subprocess_runner(command: list[str]) -> None:
+def _profile_for_home(home: Path) -> str:
+    """Pin the explicit profile that owns an already-planned Hermes home."""
+    if home.parent.name != "profiles":
+        return "default"
+    profile = home.name.casefold()
+    if not PROFILE_NAME.fullmatch(profile):
+        raise ReconciliationError(f"planned Hermes profile name is unsafe: {home.name}")
     try:
-        subprocess.run(command, check=True)
+        profile_stat = home.lstat()
+    except OSError as error:
+        raise ReconciliationError(f"planned named Hermes profile does not exist: {home}") from error
+    if home.is_symlink() or _is_reparse_point(home, profile_stat) or not stat.S_ISDIR(profile_stat.st_mode):
+        raise ReconciliationError(f"planned named Hermes profile is not a safe directory: {home}")
+    return profile
+
+
+Runner = Callable[[list[str], Mapping[str, str]], Any]
+
+
+def _subprocess_runner(command: list[str], environment: Mapping[str, str]) -> None:
+    try:
+        subprocess.run(command, check=True, env=dict(environment))
     except (OSError, subprocess.CalledProcessError) as error:
         raise ReconciliationError(f"Hermes scheduler command failed: {' '.join(command[:3])}") from error
 
@@ -402,13 +630,17 @@ def run_installer(repo_root: str | Path | None = None, *, hermes_home: str | Pat
     """Plan then, only when requested, deploy assets and invoke Hermes CLI changes."""
     root = _repo_root(repo_root)
     home = Path(hermes_home) if hermes_home is not None else Path.home() / ".hermes"
+    home_path = Path(os.path.abspath(os.fspath(home.expanduser())))
+    profile = _profile_for_home(home_path)
     actions = plan_reconcile(load_existing_jobs(home), desired_jobs(root))
     if dry_run:
         return actions
     install_assets(root, home)
     execute = runner or _subprocess_runner
+    environment = dict(os.environ)
+    environment["HERMES_HOME"] = str(home_path)
     for action in actions:
-        execute(action.command(hermes_bin))
+        execute(action.command(hermes_bin, profile), environment)
     return actions
 
 
