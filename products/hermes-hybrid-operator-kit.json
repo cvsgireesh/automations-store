@@ -1,0 +1,13 @@
+{
+  "slug": "hermes-hybrid-operator-kit",
+  "name": "Hermes Hybrid Operator Kit",
+  "version": "1.0.0",
+  "price_usd": 12,
+  "checkout_status": "pending_payout_onboarding",
+  "publication_status": "not_published",
+  "verified_revenue_usd": 0,
+  "update_policy": "Current release plus 30 days of corrections.",
+  "description": "A bounded kit for reviewed routing fragments, redacted preflight checks, staged installers, checklists, and failure drills.",
+  "verification_status": "pending_release_verification",
+  "non_affiliation": "Independent product with no relationship to Nous Research or OpenAI."
+}
