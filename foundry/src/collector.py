@@ -20,7 +20,7 @@ TIMEOUT_SECONDS = 20
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 USER_AGENT = (
     "Mozilla/5.0 (compatible; HermesProductFoundry/1.0; "
-    "+https://github.com/Dennis-Gireesh/automations-store)"
+    "+https://github.com/cvsgireesh/automations-store)"
 )
 
 
