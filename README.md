@@ -13,7 +13,7 @@ This is a dependency-free static storefront for one verified, pre-publication pr
 
 The kit describes a Generator, redacted preflight, safe installers, routing and rollback checklists, and four failure drills. It does not make production-performance, customer, cost-saving, or availability claims.
 
-The [free architecture repository](https://github.com/Dennis-Gireesh/hermes-hybrid-agent-router) is separate from this product. Independent product with no relationship to Nous Research or OpenAI.
+The [free architecture repository](https://github.com/cvsgireesh/hermes-hybrid-agent-router) is separate from this product. Independent product with no relationship to Nous Research or OpenAI.
 
 ## Local check
 

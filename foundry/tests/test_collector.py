@@ -23,7 +23,7 @@ def fixture(name: str) -> str:
 class CollectorTests(unittest.TestCase):
     def test_collector_identifies_itself_with_a_compatible_contact_user_agent(self):
         self.assertTrue(USER_AGENT.startswith("Mozilla/5.0 (compatible; HermesProductFoundry/1.0;"))
-        self.assertIn("Dennis-Gireesh/automations-store", USER_AGENT)
+        self.assertIn("cvsgireesh/automations-store", USER_AGENT)
 
     def test_parses_gumroad_transactional_metrics(self):
         signal = parse_gumroad_product(

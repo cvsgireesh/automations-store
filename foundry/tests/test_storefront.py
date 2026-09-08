@@ -222,7 +222,7 @@ class StorefrontTests(unittest.TestCase):
 
     def test_readme_links_the_free_architecture_repository(self):
         self.assertIn(
-            "https://github.com/Dennis-Gireesh/hermes-hybrid-agent-router",
+            "https://github.com/cvsgireesh/hermes-hybrid-agent-router",
             read("README.md"),
         )
 

@@ -561,7 +561,7 @@ git add proof.html products/hermes-hybrid-operator-kit.json
 git diff --cached --check
 git commit -m "release: publish operator kit verification metadata"
 git push origin main
-gh run watch --repo Dennis-Gireesh/automations-store --exit-status
+gh run watch --repo cvsgireesh/automations-store --exit-status
 ```
 
 Expected: GitHub Pages workflow succeeds; live site contains one verified product, truthful checkout status, and no prohibited claims.
